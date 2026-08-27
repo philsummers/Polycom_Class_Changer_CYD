@@ -92,9 +92,6 @@
 
 #include <ElegantOTA.h>
 
-
-const char * VERSION = "v1.0";
-
 // ---------------------------------------------------------------------------
 // Pin configuration
 // ---------------------------------------------------------------------------
@@ -123,7 +120,6 @@ const char * ntpServer = "pool.ntp.org";
 const char * timezone = "GMT0BST,M3.5.0/1,M10.5.0";
 
 AsyncWebServer webserver(80);
-//AsyncWebSocket websocket("/ws");
 
 // ---------------------------------------------------------------------------
 // Globals: display + touch
@@ -512,18 +508,6 @@ bool getNow(struct tm &t) {
   return true;
 }
 
-// find the next enabled timer at/after current time-of-day; returns index or -1
-//int findNextTimer(TimerEntry* arr, uint8_t count, int curKey) {
-//  int best = -1, bestKey = 99999;
-//  for (int i = 0; i < count; i++) {
-//    if (!arr[i].enabled) continue;
-//    int k = arr[i].hour * 60 + arr[i].minute;
-//    int delta = k - curKey;
-//    if (delta < 0) delta += 1440; // wraps to tomorrow
-//    if (delta < bestKey) { bestKey = delta; best = i; }
-//  }
-//  return best;
-//}
 
 // find the next enabled timer at/after current time-of-day, only considering
 // entries whose day mask includes the day it would land on; returns index or -1
@@ -636,8 +620,6 @@ void updateHomeClock(bool force) {
 // ---------------------------------------------------------------------------
 // Screen: HOME
 // ---------------------------------------------------------------------------
-//Btn btnOpenA   = {10, 160, 145, 34};
-//Btn btnOpenB   = {165, 160, 145, 34};
 Btn btnSettings= {10, 200, 90, 32};
 Btn btnTestA   = {110, 200, 90, 32};
 Btn btnTestB   = {220, 200, 90, 32};
@@ -661,7 +643,6 @@ void drawHome() {
   tft.drawString(WiFi.status() == WL_CONNECTED ? "WiFi OK" : "WiFi --", SCREEN_W - 6, 6, 2);
 
   // Panel A
-  //tft.fillRoundRect(10, 40, 145, 82, 6, COL_PANEL);
   tft.fillRoundRect(10, 40, 125, 82, 6, COL_PANEL);
   tft.setTextDatum(TL_DATUM);
   tft.setTextColor(COL_TEXT, COL_PANEL);
@@ -671,7 +652,6 @@ void drawHome() {
   char bufA[24];
   snprintf(bufA, sizeof(bufA), "%d timer(s)", countA);
   tft.drawString(bufA, 20, 88, 2);
-  //drawButton(btnOpenA, "Edit A");
 
   // Panel B
   tft.fillRoundRect(165, 40, 125, 82, 6, COL_PANEL);
@@ -680,7 +660,6 @@ void drawHome() {
   char bufB[24];
   snprintf(bufB, sizeof(bufB), "%d timer(s)", countB);
   tft.drawString(bufB, 175, 88, 2);
-  //drawButton(btnOpenB, "Edit B");
 
   drawButton(btnSettings, "Settings");
   drawButton(btnTestA, "Test A");
@@ -800,8 +779,6 @@ void drawSettings() {
   tft.setTextDatum(TL_DATUM);
   tft.setTextColor(COL_TEXT, COL_BG);
   tft.drawString("Manual time (used if no WiFi):", 10, 100, 2);
-
-  tft.drawString(VERSION,120,210,2);
 
   char hm[8];
   snprintf(hm, sizeof(hm), "%02d:%02d", manualTime.tm_hour, manualTime.tm_min);
@@ -1039,7 +1016,6 @@ void onRootRequest(AsyncWebServerRequest *request) {
 
 void initWebServer() {
     webserver.on("/", onRootRequest);
-    //webserver.serveStatic("/",SPIFFS,"/");
     ElegantOTA.begin(&webserver);
     webserver.begin();
 }
@@ -1082,11 +1058,15 @@ void setup() {
   tft.setTextColor(COL_TEXT, COL_BG);
   tft.drawString("Connecting WiFi (or setup AP)...", SCREEN_W / 2, SCREEN_H / 2, 2);
 
+  char ver[16];
+  snprintf(ver, sizeof(ver), "Firmware: %s", AUTO_VERSION);
+
+  tft.drawString(ver,SCREEN_W/2, (SCREEN_H/2)+30,2);
+
   WiFiManager wm;
   wm.setConfigPortalTimeout(60); // don't block forever if no WiFi around
   bool ok = wm.autoConnect("BellScheduler-Setup");
   if (ok) {
-    //configTime(tzOffsetMinutes * 60, 0, "pool.ntp.org", "time.nist.gov");
     configTzTime(timezone,ntpServer);
     struct tm t;
     timeSynced = getLocalTime(&t, 8000);
