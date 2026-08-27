@@ -387,7 +387,7 @@ uint8_t lastNTPSyncHour = 25;
 // ---------------------------------------------------------------------------
 // UI state
 // ---------------------------------------------------------------------------
-enum Screen { SCR_HOME, SCR_LIST, SCR_EDIT, SCR_SETTINGS, SCR_CALIB };
+enum Screen { SCR_HOME, SCR_LIST, SCR_EDIT, SCR_SETTINGS, SCR_CALIB, SCR_HOL_LIST, SCR_HOL_EDIT, SCR_SERVICE };
 Screen currentScreen = SCR_HOME;
 
 int activeSchedule = 0; // 0 = A, 1 = B (which schedule LIST/EDIT is working on)
@@ -406,6 +406,25 @@ const char* DAY_LABELS[5] = { "Mon", "Tue", "Wed", "Thu", "Fri" };
 const uint8_t DAY_BITS[5] = { DAY_MON, DAY_TUE, DAY_WED, DAY_THU, DAY_FRI };
 const char DAY_LETTERS[5] = { 'M', 'T', 'W', 'T', 'F' };
 
+
+// Term dates / holiday overrides: date ranges (inclusive) during which BOTH
+// schedules are muted entirely, e.g. half-term, Christmas break, INSET days.
+// Declared here (not down in its own section) for the same reason as
+// calibStep above - the Settings screen needs to reference it when opening
+// the "Term Dates" button, and that code appears earlier in the file.
+#define MAX_HOLIDAYS 20
+struct HolidayRange {
+  uint8_t enabled;
+  uint16_t startYear; uint8_t startMonth; uint8_t startDay;
+  uint16_t endYear;   uint8_t endMonth;   uint8_t endDay;
+};
+HolidayRange holidays[MAX_HOLIDAYS];
+uint8_t holidayCount = 0;
+int holListPage = 0;
+int holEditIndex = -1; // -1 = adding a new range
+HolidayRange holEditBuffer;
+const int HOL_ROWS_PER_PAGE = 5;
+
 // ---------------------------------------------------------------------------
 // Persistence
 // ---------------------------------------------------------------------------
@@ -422,9 +441,12 @@ void loadSchedules() {
   tsMaxX = prefs.getShort("tsMaxX", tsMaxX);
   tsMinY = prefs.getShort("tsMinY", tsMinY);
   tsMaxY = prefs.getShort("tsMaxY", tsMaxY);
+  holidayCount = prefs.getUChar("holCount", 0);
+  prefs.getBytes("holidays", holidays, sizeof(holidays));
   prefs.end();
   if (countA > MAX_TIMERS) countA = 0;
   if (countB > MAX_TIMERS) countB = 0;
+  if (holidayCount > MAX_HOLIDAYS) holidayCount = 0;
 }
 
 void saveSchedules() {
@@ -436,6 +458,8 @@ void saveSchedules() {
   prefs.putShort("tz", tzOffsetMinutes);
   prefs.putBytes("schedA", scheduleA, sizeof(scheduleA));
   prefs.putBytes("schedB", scheduleB, sizeof(scheduleB));
+  prefs.putUChar("holCount", holidayCount);
+  prefs.putBytes("holidays", holidays, sizeof(holidays));
   prefs.end();
 }
 
@@ -476,6 +500,27 @@ void daysToStr(uint8_t days, char* out) {
   for (int i = 0; i < 5; i++) out[i] = (days & DAY_BITS[i]) ? DAY_LETTERS[i] : '.';
   out[5] = '\0';
 }
+
+// ---- term dates / holiday overrides -----------------------------------
+long dateVal(uint16_t y, uint8_t m, uint8_t d) { return (long)y * 10000L + (long)m * 100L + d; }
+
+bool isHolidayToday(struct tm &t) {
+  long today = dateVal(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
+  for (int i = 0; i < holidayCount; i++) {
+    if (!holidays[i].enabled) continue;
+    long s = dateVal(holidays[i].startYear, holidays[i].startMonth, holidays[i].startDay);
+    long e = dateVal(holidays[i].endYear, holidays[i].endMonth, holidays[i].endDay);
+    if (today >= s && today <= e) return true;
+  }
+  return false;
+}
+
+uint8_t incMonth(uint8_t m) { return (m % 12) + 1; }
+uint8_t decMonth(uint8_t m) { return ((m + 10) % 12) + 1; }
+uint8_t incDay(uint8_t d) { return (d % 31) + 1; }
+uint8_t decDay(uint8_t d) { return ((d + 29) % 31) + 1; }
+uint16_t incYear(uint16_t y) { return y >= 2099 ? 2020 : y + 1; }
+uint16_t decYear(uint16_t y) { return y <= 2020 ? 2099 : y - 1; }
 
 bool getTouchPoint(int16_t &x, int16_t &y) {
   if (!ts.touched()) return false;
@@ -585,6 +630,8 @@ void checkSchedules() {
 void updateHomeClock(bool force) {
   static char lastLine1[32] = "";
   static char lastLine2[64] = "";
+  static bool lastHoliday = false;
+
   struct tm t;
   char line1[32], line2[64];
 
@@ -594,7 +641,25 @@ void updateHomeClock(bool force) {
     snprintf(line1, sizeof(line1), "-- clock not set --");
   }
 
-  int curKey = -1;
+  bool onHoliday = false;
+  
+  int nextA = -1, nextB = -1;
+  if (getNow(t)) {
+    onHoliday = isHolidayToday(t);
+    int curKey = t.tm_hour * 60 + t.tm_min;
+    nextA = findNextTimer(scheduleA, countA, curKey, t.tm_wday);
+    nextB = findNextTimer(scheduleB, countB, curKey, t.tm_wday);
+  }
+  if (onHoliday) {
+    snprintf(line2, sizeof(line2), "TERM DATE OVERRIDE - no bells today");
+  } else {
+    char nextAStr[24] = "--:--", nextBStr[24] = "--:--";
+    if (nextA >= 0) snprintf(nextAStr, sizeof(nextAStr), "%02d:%02d", scheduleA[nextA].hour, scheduleA[nextA].minute);
+    if (nextB >= 0) snprintf(nextBStr, sizeof(nextBStr), "%02d:%02d", scheduleB[nextB].hour, scheduleB[nextB].minute);
+    snprintf(line2, sizeof(line2), "Next A: %s   Next B: %s", nextAStr, nextBStr);
+  }
+
+  /*int curKey = -1;
   if (getNow(t)) curKey = t.tm_hour * 60 + t.tm_min;
   int nA = curKey >= 0 ? findNextTimer(scheduleA, countA, curKey,t.tm_wday) : -1;
   int nB = curKey >= 0 ? findNextTimer(scheduleB, countB, curKey,t.tm_wday) : -1;
@@ -602,6 +667,9 @@ void updateHomeClock(bool force) {
   if (nA >= 0) snprintf(nextA, sizeof(nextA), "%02d:%02d", scheduleA[nA].hour, scheduleA[nA].minute);
   if (nB >= 0) snprintf(nextB, sizeof(nextB), "%02d:%02d", scheduleB[nB].hour, scheduleB[nB].minute);
   snprintf(line2, sizeof(line2), "Next A: %s   Next B: %s", nextA, nextB);
+  */
+ 
+
 
   if (force || strcmp(line1, lastLine1) != 0) {
     tft.fillRect(0, 125, SCREEN_W, 16, COL_BG);
@@ -610,10 +678,12 @@ void updateHomeClock(bool force) {
     tft.drawString(line1, SCREEN_W / 2, 125, 4);
     strcpy(lastLine1, line1);
   }
-  if (force || strcmp(line2, lastLine2) != 0) {
+  if (force || strcmp(line2, lastLine2) != 0 || onHoliday != lastHoliday) {
     tft.fillRect(0, 161, SCREEN_W, 14, COL_BG);
+    tft.setTextColor(onHoliday ? TFT_RED : COL_TEXT, COL_BG);
     tft.drawString(line2, SCREEN_W / 2, 161, 2);
     strcpy(lastLine2, line2);
+    lastHoliday = onHoliday;
   }
 }
 
@@ -986,7 +1056,133 @@ void handleSettingsTouch(int16_t x, int16_t y) {
   if (hit(btnOpenB, x, y)) { activeSchedule = 1; listPage = 0; currentScreen = SCR_LIST; drawList(); return; }
 }
 
+// ---------------------------------------------------------------------------
+// Screen: SERVICE MENU (hidden - installer/diagnostics only)
+// ---------------------------------------------------------------------------
+// Not reachable from any visible button. Opened by pressing and holding the
+// empty top-left corner of the Home screen (an invisible hotspot) for
+// SERVICE_HOLD_MS. This keeps it out of the way of normal end-user staff
+// while still being easy for whoever installed the unit to find again.
+#define SERVICE_HOLD_MS 1500
+Btn svcHotspot = {0, 0, 50, 40}; // invisible - top-left corner of Home screen only
+unsigned long svcHoldStart = 0;
 
+Btn btnSvcTestA = {10, 125, 145, 28}, btnSvcTestB = {165, 125, 145, 28};
+Btn btnSvcRestart = {10, 159, 145, 28}, btnSvcReset = {165, 159, 145, 28};
+Btn btnSvcBack = {10, 200, 90, 32};
+
+bool resetArmed = false;
+unsigned long resetArmedAt = 0;
+#define RESET_ARM_WINDOW_MS 4000
+
+void drawServiceInfo() {
+  tft.fillRect(0, 30, SCREEN_W, 82, COL_BG); // ends exactly where the button row begins (y=112)
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(COL_TEXT, COL_BG);
+  char line[64];
+  int y = 32;
+
+
+  snprintf(line, sizeof(line), "Firmware version: %s", AUTO_VERSION);
+  tft.drawString(line,10,y,1); y+= 13;
+
+  snprintf(line, sizeof(line), "Firmware built: %s %s", __DATE__, __TIME__);
+  tft.drawString(line, 10, y, 1); y += 13;
+  
+  unsigned long upSec = millis() / 1000;
+  snprintf(line, sizeof(line), "Uptime: %luh %02lum %02lus", upSec / 3600, (upSec / 60) % 60, upSec % 60);
+  tft.drawString(line, 10, y, 1); y += 13;
+
+  snprintf(line, sizeof(line), "Free heap: %lu bytes", (unsigned long)ESP.getFreeHeap());
+  tft.drawString(line, 10, y, 1); y += 13;
+ if (WiFi.status() == WL_CONNECTED) {
+    snprintf(line, sizeof(line), "WiFi: %s  IP: %s  RSSI: %d dBm",
+             WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  } else {
+    snprintf(line, sizeof(line), "WiFi: not connected");
+  }
+  tft.drawString(line, 10, y, 1); y += 13;
+
+  snprintf(line, sizeof(line), "Touch cal: X[%d,%d] Y[%d,%d]", tsMinX, tsMaxX, tsMinY, tsMaxY);
+  tft.drawString(line, 10, y, 1); y += 13;
+
+  tft.fillRect(0, y, SCREEN_W, 13, COL_BG);
+  if (ts.touched()) {
+    TS_Point p = ts.getPoint();
+    snprintf(line, sizeof(line), "Raw touch: X=%d Y=%d (touch anywhere to test)", p.x, p.y);
+  } else {
+    snprintf(line, sizeof(line), "Raw touch: -- (touch anywhere to test)");
+  }
+  tft.drawString(line, 10, y, 1);
+}
+
+void drawService() {
+  tft.fillScreen(COL_BG);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(COL_ACCENT, COL_BG);
+  tft.drawString("Service Menu", SCREEN_W / 2, 4, 2);
+  resetArmed = false;
+  drawServiceInfo();
+
+  drawButton(btnSvcTestA, "Test Bell A");
+  drawButton(btnSvcTestB, "Test Bell B");
+  drawButton(btnSvcRestart, "Restart Device");
+  drawButton(btnSvcReset, "Factory Reset", COL_BTN_OFF);
+  drawButton(btnSvcBack, "Back");
+}
+
+void handleServiceTouch(int16_t x, int16_t y) {
+  if (hit(btnSvcTestA, x, y)) { triggerBellA(); return; }
+  if (hit(btnSvcTestB, x, y)) { triggerBellB(); return; }
+  if (hit(btnSvcRestart, x, y)) { ESP.restart(); return; }
+  if (hit(btnSvcReset, x, y)) {
+    if (!resetArmed) {
+      resetArmed = true;
+      resetArmedAt = millis();
+      drawButton(btnSvcReset, "Tap to CONFIRM", TFT_RED);
+    } else {
+      prefs.begin("belltimer", false);
+      prefs.clear();
+      prefs.end();
+      ESP.restart();
+    }
+    return;
+  }
+  if (hit(btnSvcBack, x, y)) { currentScreen = SCR_HOME; drawHome(); return; }
+}
+
+// Long-press detector for the hidden entry gesture, plus the live info
+// refresh while the service screen is open. Called every loop() iteration
+// regardless of which screen is active.
+void serviceMenuTick() {
+  if (currentScreen == SCR_HOME) {
+    if (ts.touched()) {
+      TS_Point p = ts.getPoint();
+      int16_t mx = constrain(map(p.x, tsMinX, tsMaxX, 0, SCREEN_W), 0, SCREEN_W - 1);
+      int16_t my = constrain(map(p.y, tsMinY, tsMaxY, 0, SCREEN_H), 0, SCREEN_H - 1);
+      if (hit(svcHotspot, mx, my)) {
+        if (svcHoldStart == 0) svcHoldStart = millis();
+        else if (millis() - svcHoldStart >= SERVICE_HOLD_MS) {
+          svcHoldStart = 0;
+          touchWasDown = true; // swallow the release so it doesn't also fire a Home tap
+          currentScreen = SCR_SERVICE;
+          drawService();
+        }
+      } else {
+        svcHoldStart = 0;
+      }
+    } else {
+      svcHoldStart = 0;
+    }
+  } else if (currentScreen == SCR_SERVICE) {
+    if (resetArmed && millis() - resetArmedAt > RESET_ARM_WINDOW_MS) {
+      resetArmed = false;
+      drawButton(btnSvcReset, "Factory Reset", COL_BTN_OFF);
+    }
+    static unsigned long lastInfoRefresh = 0;
+    if (millis() - lastInfoRefresh > 400) { drawServiceInfo(); lastInfoRefresh = millis(); }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Touch dispatch
@@ -1001,6 +1197,7 @@ void handleTouch() {
       case SCR_EDIT:     handleEditTouch(x, y); break;
       case SCR_SETTINGS: handleSettingsTouch(x, y); break;
       case SCR_CALIB:    handleCalibTouch(); break;
+      case SCR_SERVICE:  handleServiceTouch(x, y); break;
     }
   }
   touchWasDown = down;
@@ -1111,6 +1308,7 @@ void loop() {
   serviceBells();
   checkSchedules();
   handleTouch();
+  serviceMenuTick();
 
   if (currentScreen == SCR_HOME) {
     static unsigned long lastClock = 0;
