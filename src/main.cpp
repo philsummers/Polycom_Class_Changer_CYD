@@ -149,6 +149,9 @@ int16_t tsMinX = 200, tsMaxX = 3800, tsMinY = 200, tsMaxY = 3800;
 #define LEDC_TIMER_12_BIT 12
 #define LEDC_BASE_FREQ 5000
 
+
+TFT_eSprite scrnSprite = TFT_eSprite(&tft);
+
 // ---------------------------------------------------------------------------
 // Polycom
 // ---------------------------------------------------------------------------
@@ -157,8 +160,8 @@ const int port = 5001;
 
 WiFiUDP udp;
 
-const uint8_t channel1 = 0x23;    // Paging Group 1
-const uint8_t channel2 = 0x24;    // Paging Group 2
+const uint8_t channel1 = 0x23;    // Paging Group 1 - Polycom Group 10
+const uint8_t channel2 = 0x24;    // Paging Group 2 - Polycom Group 11
 
 uint32_t serial = 0x00010203;
 char caller[13] = "CLASS-CHANGE";
@@ -389,7 +392,7 @@ uint8_t lastNTPSyncHour = 25;
 // ---------------------------------------------------------------------------
 // UI state
 // ---------------------------------------------------------------------------
-enum Screen { SCR_HOME, SCR_LIST, SCR_EDIT, SCR_SETTINGS, SCR_CALIB, SCR_HOL_LIST, SCR_HOL_EDIT, SCR_SERVICE };
+enum Screen { SCR_HOME, SCR_LIST, SCR_EDIT, SCR_SETTINGS, SCR_CALIB, SCR_HOL_LIST, SCR_HOL_EDIT, SCR_SERVICE, SCR_SCREENSAVER_CFG, SCR_SCREENSAVER };
 Screen currentScreen = SCR_HOME;
 
 int activeSchedule = 0; // 0 = A, 1 = B (which schedule LIST/EDIT is working on)
@@ -400,6 +403,15 @@ const int ROWS_PER_PAGE = 5;
 
 bool touchWasDown = false; // simple debounce so one tap = one action
 
+// Screensaver: shows a moving clock during idle time on the Home screen,
+// wakes on any touch, and also wakes itself early if a bell is coming up
+// soon. Declared here (not down in its own section) for the same reason as
+// calibStep/holidays above - the Settings screen and the touch dispatcher,
+// both earlier in this file, need to reference this state.
+bool screensaverEnabled = true;
+uint8_t screensaverIdleMinutes = 3;
+unsigned long lastActivityMillis = 0;
+#define SCREENSAVER_WAKE_LEAD_MIN 5 // wake automatically this many minutes before a due bell
 
 
 struct Btn { int16_t x, y, w, h; };
@@ -445,10 +457,13 @@ void loadSchedules() {
   tsMaxY = prefs.getShort("tsMaxY", tsMaxY);
   holidayCount = prefs.getUChar("holCount", 0);
   prefs.getBytes("holidays", holidays, sizeof(holidays));
+  screensaverEnabled = prefs.getBool("ssEn", true);
+  screensaverIdleMinutes = prefs.getUChar("ssMin", 3);
   prefs.end();
   if (countA > MAX_TIMERS) countA = 0;
   if (countB > MAX_TIMERS) countB = 0;
   if (holidayCount > MAX_HOLIDAYS) holidayCount = 0;
+  if (screensaverIdleMinutes < 1 || screensaverIdleMinutes > 30) screensaverIdleMinutes = 3;
 }
 
 void saveSchedules() {
@@ -462,6 +477,8 @@ void saveSchedules() {
   prefs.putBytes("schedB", scheduleB, sizeof(scheduleB));
   prefs.putUChar("holCount", holidayCount);
   prefs.putBytes("holidays", holidays, sizeof(holidays));
+  prefs.putBool("ssEn", screensaverEnabled);
+  prefs.putUChar("ssMin", screensaverIdleMinutes);
   prefs.end();
 }
 
@@ -578,6 +595,44 @@ int findNextTimer(TimerEntry* arr, uint8_t count, int curKey, int curWday) {
   return best;
 }
 
+// Minutes until the earliest still-upcoming enabled timer scheduled for
+// TODAY on either schedule, or -1 if none remain today (weekend, holiday
+// override, or nothing left on the clock). Deliberately only looks at
+// today - not tomorrow - since its only use is deciding whether to keep the
+// screensaver off; a small blind spot right around midnight for a very
+// early first bell is an acceptable trade-off for the simplicity here.
+int minutesUntilNextBellToday() {
+  struct tm t;
+  if (!getNow(t)) return -1;
+  if (isHolidayToday(t)) return -1;
+  if (t.tm_wday == 0 || t.tm_wday == 6) return -1;
+  uint8_t todayBit = DAY_BITS[t.tm_wday - 1];
+  int curKey = t.tm_hour * 60 + t.tm_min;
+  int best = -1;
+  if (scheduleAEnabled) {
+    for (int i = 0; i < countA; i++) {
+      if (scheduleA[i].enabled && (scheduleA[i].days & todayBit)) {
+        int k = scheduleA[i].hour * 60 + scheduleA[i].minute;
+        if (k >= curKey && (best == -1 || k < best)) best = k;
+      }
+    }
+  }
+  if (scheduleBEnabled) {
+    for (int i = 0; i < countB; i++) {
+      if (scheduleB[i].enabled && (scheduleB[i].days & todayBit)) {
+        int k = scheduleB[i].hour * 60 + scheduleB[i].minute;
+        if (k >= curKey && (best == -1 || k < best)) best = k;
+      }
+    }
+  }
+  return best == -1 ? -1 : (best - curKey);
+}
+
+bool bellImminent() {
+  int m = minutesUntilNextBellToday();
+  return m >= 0 && m <= SCREENSAVER_WAKE_LEAD_MIN;
+}
+
 // ---------------------------------------------------------------------------
 // Bell firing (non-blocking pulses)
 // ---------------------------------------------------------------------------
@@ -611,7 +666,6 @@ void checkSchedules() {
     for (int i = 0; i < countA; i++) {
       if (scheduleA[i].enabled && (scheduleA[i].days & todayBit) &&
           (scheduleA[i].hour * 60 + scheduleA[i].minute) == curKey) {
-      //if (scheduleA[i].enabled && (scheduleA[i].hour * 60 + scheduleA[i].minute) == curKey) {
         triggerBellA();
         break;
       }
@@ -621,7 +675,6 @@ void checkSchedules() {
     for (int i = 0; i < countB; i++) {
        if (scheduleB[i].enabled && (scheduleB[i].days & todayBit) &&
           (scheduleB[i].hour * 60 + scheduleB[i].minute) == curKey) {
-      //if (scheduleB[i].enabled && (scheduleB[i].hour * 60 + scheduleB[i].minute) == curKey) {      
         triggerBellB();
         break;
       }
@@ -660,18 +713,6 @@ void updateHomeClock(bool force) {
     if (nextB >= 0) snprintf(nextBStr, sizeof(nextBStr), "%02d:%02d", scheduleB[nextB].hour, scheduleB[nextB].minute);
     snprintf(line2, sizeof(line2), "Next A: %s   Next B: %s", nextAStr, nextBStr);
   }
-
-  /*int curKey = -1;
-  if (getNow(t)) curKey = t.tm_hour * 60 + t.tm_min;
-  int nA = curKey >= 0 ? findNextTimer(scheduleA, countA, curKey,t.tm_wday) : -1;
-  int nB = curKey >= 0 ? findNextTimer(scheduleB, countB, curKey,t.tm_wday) : -1;
-  char nextA[24] = "--:--", nextB[24] = "--:--";
-  if (nA >= 0) snprintf(nextA, sizeof(nextA), "%02d:%02d", scheduleA[nA].hour, scheduleA[nA].minute);
-  if (nB >= 0) snprintf(nextB, sizeof(nextB), "%02d:%02d", scheduleB[nB].hour, scheduleB[nB].minute);
-  snprintf(line2, sizeof(line2), "Next A: %s   Next B: %s", nextA, nextB);
-  */
- 
-
 
   if (force || strcmp(line1, lastLine1) != 0) {
     tft.fillRect(0, 125, SCREEN_W, 16, COL_BG);
@@ -824,6 +865,7 @@ void drawEdit() {
 
 Btn btnWifiSetup = {10, 32, 300, 30};
 Btn btnCalibrate = {10, 66, 300, 30};
+Btn btnScreensaver = {10, 106, 300, 20};
 Btn btnHrUp2 = {235, 116, 40, 30}, btnHrDn2 = {195, 116, 40, 30};
 Btn btnMinUp2 = {150, 116, 40, 30}, btnMinDn2 = {110, 116, 40, 30};
 Btn btnApplyTime = {10, 150, 140, 28};
@@ -843,6 +885,7 @@ void drawSettings() {
              "WiFi Connected - Reconfigure" : "Set Up WiFi");
 
   drawButton(btnCalibrate, "Calibrate Touch");
+  drawButton(btnScreensaver, "Screensaver");
 
   if (!getNow(manualTime)) {
     manualTime = { 0 };
@@ -953,6 +996,58 @@ const int16_t CAL_TL_X = 24, CAL_TL_Y = 24;
 const int16_t CAL_BR_X = SCREEN_W - 24, CAL_BR_Y = SCREEN_H - 24;
 
 // ---------------------------------------------------------------------------
+// Screen: SCREENSAVER SETTINGS
+// ---------------------------------------------------------------------------
+Btn btnSsEnable = {10, 30, 300, 28};
+Btn btnSsMinusMin = {80, 84, 50, 28}, btnSsPlusMin = {230, 84, 50, 28};
+Btn btnSsBack = {10, 200, 90, 32};
+
+void drawScreensaverSettings() {
+  tft.fillScreen(COL_BG);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(COL_ACCENT, COL_BG);
+  tft.drawString("Screensaver", SCREEN_W / 2, 2, 2);
+
+  drawButton(btnSsEnable, screensaverEnabled ? "Screensaver: ON" : "Screensaver: OFF",
+             screensaverEnabled ? COL_BTN_ON : COL_BTN_OFF);
+
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(COL_TEXT, COL_BG);
+  tft.drawString("Idle timeout:", 10, 70, 2);
+  drawButton(btnSsMinusMin, "-");
+  drawButton(btnSsPlusMin, "+");
+  char mins[16];
+  snprintf(mins, sizeof(mins), "%d min", screensaverIdleMinutes);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(COL_TEXT, COL_BG);
+  tft.drawString(mins, 165, 98, 4);
+
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(COL_TEXT, COL_BG);
+  tft.drawString("Only kicks in from the Home screen. Wakes on any", 10, 140, 1);
+  char note2[64];
+  snprintf(note2, sizeof(note2), "touch, or automatically %d min before a due bell.", SCREENSAVER_WAKE_LEAD_MIN);
+  tft.drawString(note2, 10, 152, 1);
+
+  drawButton(btnSsBack, "Back");
+}
+
+void handleScreensaverSettingsTouch(int16_t x, int16_t y) {
+  if (hit(btnSsEnable, x, y)) { screensaverEnabled = !screensaverEnabled; saveSchedules(); drawScreensaverSettings(); return; }
+  if (hit(btnSsMinusMin, x, y)) {
+    if (screensaverIdleMinutes > 1) screensaverIdleMinutes--;
+    saveSchedules(); drawScreensaverSettings(); return;
+  }
+  if (hit(btnSsPlusMin, x, y)) {
+    if (screensaverIdleMinutes < 30) screensaverIdleMinutes++;
+    saveSchedules(); drawScreensaverSettings(); return;
+  }
+  if (hit(btnSsBack, x, y)) { currentScreen = SCR_SETTINGS; drawSettings(); return; }
+}
+
+
+
+// ---------------------------------------------------------------------------
 // Screen: TOUCH CALIBRATION (2-point)
 // ---------------------------------------------------------------------------
 
@@ -1021,7 +1116,6 @@ void handleSettingsTouch(int16_t x, int16_t y) {
     wm.setConfigPortalTimeout(180);
     wm.startConfigPortal("BellScheduler-Setup");
     if (WiFi.status() == WL_CONNECTED) {
-      //configTime(tzOffsetMinutes * 60, 0, "pool.ntp.org", "time.nist.gov");
       configTzTime(timezone,ntpServer);
     }
     drawSettings();
@@ -1032,6 +1126,12 @@ void handleSettingsTouch(int16_t x, int16_t y) {
     calibStep = CAL_TL;
     currentScreen = SCR_CALIB;
     drawCalib();
+    return;
+  }
+
+  if (hit(btnScreensaver, x, y)) {
+    currentScreen = SCR_SCREENSAVER_CFG;
+    drawScreensaverSettings();
     return;
   }
 
@@ -1186,6 +1286,78 @@ void serviceMenuTick() {
   }
 }
 
+
+// ---------------------------------------------------------------------------
+// Screen: SCREENSAVER (idle display)
+// ---------------------------------------------------------------------------
+// A bouncing "DVD logo"-style box showing the current time, changing color
+// each time it bounces off an edge. Purely cosmetic, but keeping the clock
+// visible means the screen still does something useful while idle. Only
+// ever entered from Home (see the idle check in loop()), and only ever
+// exits back to Home - on any touch (see handleTouch() above) or
+// automatically once a bell is due soon (see screensaverTick() below).
+const int16_t SS_BOX_W = 140, SS_BOX_H = 50;
+const int16_t SS_TOP_MARGIN = 20; // keep clear of nothing in particular - just looks better
+float ssX = 60, ssY = 60, ssVX = 1.6, ssVY = 1.3;
+uint16_t ssColor = TFT_CYAN;
+unsigned long lastSsFrame = 0;
+
+uint16_t randomBounceColor() {
+  uint16_t palette[] = { TFT_CYAN, TFT_YELLOW, TFT_MAGENTA, TFT_GREEN, TFT_ORANGE, COL_ACCENT };
+  return palette[random(0, 6)];
+}
+
+void enterScreensaver() {
+  tft.fillScreen(COL_BG);
+  ssX = random(0, SCREEN_W - SS_BOX_W);
+  ssY = random(SS_TOP_MARGIN, SCREEN_H - SS_BOX_H);
+  ssVX = random(0, 2) ? 1.6 : -1.6;
+  ssVY = random(0, 2) ? 1.3 : -1.3;
+  ssColor = randomBounceColor();
+  lastSsFrame = millis();
+  currentScreen = SCR_SCREENSAVER;
+}
+
+void exitScreensaver() {
+  currentScreen = SCR_HOME;
+  drawHome();
+}
+
+void screensaverTick() {
+  if (currentScreen != SCR_SCREENSAVER) return;
+
+  if (bellImminent()) { exitScreensaver(); return; } // wake early for an upcoming bell
+
+  if (millis() - lastSsFrame < 40) return; // ~25fps, plenty smooth for this
+  lastSsFrame = millis();
+
+  scrnSprite.fillRect((int)ssX, (int)ssY, SS_BOX_W, SS_BOX_H, COL_BG); // erase old position
+
+
+  ssX += ssVX;
+  ssY += ssVY;
+  bool bounced = false;
+  if (ssX <= 0) { ssX = 0; ssVX = -ssVX; bounced = true; }
+  if (ssX + SS_BOX_W >= SCREEN_W) { ssX = SCREEN_W - SS_BOX_W; ssVX = -ssVX; bounced = true; }
+  if (ssY <= SS_TOP_MARGIN) { ssY = SS_TOP_MARGIN; ssVY = -ssVY; bounced = true; }
+  if (ssY + SS_BOX_H >= SCREEN_H) { ssY = SCREEN_H - SS_BOX_H; ssVY = -ssVY; bounced = true; }
+  if (bounced) ssColor = randomBounceColor();
+
+
+  scrnSprite.fillRoundRect((int)ssX, (int)ssY, SS_BOX_W, SS_BOX_H, 8, ssColor);
+  scrnSprite.drawRoundRect((int)ssX, (int)ssY, SS_BOX_W, SS_BOX_H, 8, TFT_WHITE);
+
+  struct tm t;
+  char hm[8] = "--:--";
+  if (getNow(t)) snprintf(hm, sizeof(hm), "%02d:%02d", t.tm_hour, t.tm_min);
+  
+  scrnSprite.setTextDatum(MC_DATUM);
+  scrnSprite.setTextColor(TFT_BLACK, ssColor);
+  scrnSprite.drawString(hm, (int)ssX + SS_BOX_W / 2, (int)ssY + SS_BOX_H / 2, 4);
+
+  scrnSprite.pushSprite(0,0);
+}
+
 // ---------------------------------------------------------------------------
 // Touch dispatch
 // ---------------------------------------------------------------------------
@@ -1193,6 +1365,7 @@ void handleTouch() {
   int16_t x, y;
   bool down = getTouchPoint(x, y);
   if (down && !touchWasDown) {
+    lastActivityMillis = millis(); // any tap counts as activity, on any screen
     switch (currentScreen) {
       case SCR_HOME:     handleHomeTouch(x, y); break;
       case SCR_LIST:     handleListTouch(x, y); break;
@@ -1200,6 +1373,8 @@ void handleTouch() {
       case SCR_SETTINGS: handleSettingsTouch(x, y); break;
       case SCR_CALIB:    handleCalibTouch(); break;
       case SCR_SERVICE:  handleServiceTouch(x, y); break;
+      case SCR_SCREENSAVER_CFG: handleScreensaverSettingsTouch(x, y); break;
+      case SCR_SCREENSAVER: exitScreensaver(); break; // any tap wakes it
     }
   }
   touchWasDown = down;
@@ -1248,6 +1423,10 @@ void setup() {
   int w = tft.width();
   int h = tft.height();
 
+  scrnSprite.setColorDepth(8);
+  scrnSprite.createSprite(w,h);
+  scrnSprite.fillSprite(COL_BG);
+
   Serial.print("Width:"); Serial.println(w);
   Serial.print("Height:"); Serial.println(h);
 
@@ -1291,6 +1470,7 @@ void setup() {
 
   currentScreen = SCR_HOME;
   drawHome();
+  lastActivityMillis = millis(); // start the idle clock from here, not from cold boot
 }
 
 void loop() {
@@ -1311,10 +1491,16 @@ void loop() {
   checkSchedules();
   handleTouch();
   serviceMenuTick();
+  screensaverTick();
 
   if (currentScreen == SCR_HOME) {
     static unsigned long lastClock = 0;
     if (millis() - lastClock > 500) { updateHomeClock(false); lastClock = millis(); }
+    
+    if (screensaverEnabled && !bellImminent() &&
+        millis() - lastActivityMillis > (unsigned long)screensaverIdleMinutes * 60000UL) {
+      enterScreensaver();
+    }
   }
 
   ElegantOTA.loop();
