@@ -666,7 +666,6 @@ void checkSchedules() {
     for (int i = 0; i < countA; i++) {
       if (scheduleA[i].enabled && (scheduleA[i].days & todayBit) &&
           (scheduleA[i].hour * 60 + scheduleA[i].minute) == curKey) {
-      //if (scheduleA[i].enabled && (scheduleA[i].hour * 60 + scheduleA[i].minute) == curKey) {
         triggerBellA();
         break;
       }
@@ -676,7 +675,6 @@ void checkSchedules() {
     for (int i = 0; i < countB; i++) {
        if (scheduleB[i].enabled && (scheduleB[i].days & todayBit) &&
           (scheduleB[i].hour * 60 + scheduleB[i].minute) == curKey) {
-      //if (scheduleB[i].enabled && (scheduleB[i].hour * 60 + scheduleB[i].minute) == curKey) {      
         triggerBellB();
         break;
       }
@@ -1118,7 +1116,6 @@ void handleSettingsTouch(int16_t x, int16_t y) {
     wm.setConfigPortalTimeout(180);
     wm.startConfigPortal("BellScheduler-Setup");
     if (WiFi.status() == WL_CONNECTED) {
-      //configTime(tzOffsetMinutes * 60, 0, "pool.ntp.org", "time.nist.gov");
       configTzTime(timezone,ntpServer);
     }
     drawSettings();
@@ -1312,7 +1309,6 @@ uint16_t randomBounceColor() {
 
 void enterScreensaver() {
   tft.fillScreen(COL_BG);
-  //scrnSprite.fillSprite(COL_BG);
   ssX = random(0, SCREEN_W - SS_BOX_W);
   ssY = random(SS_TOP_MARGIN, SCREEN_H - SS_BOX_H);
   ssVX = random(0, 2) ? 1.6 : -1.6;
@@ -1335,7 +1331,6 @@ void screensaverTick() {
   if (millis() - lastSsFrame < 40) return; // ~25fps, plenty smooth for this
   lastSsFrame = millis();
 
-  //tft.fillRect((int)ssX, (int)ssY, SS_BOX_W, SS_BOX_H, COL_BG); // erase old position
   scrnSprite.fillRect((int)ssX, (int)ssY, SS_BOX_W, SS_BOX_H, COL_BG); // erase old position
 
 
@@ -1348,8 +1343,6 @@ void screensaverTick() {
   if (ssY + SS_BOX_H >= SCREEN_H) { ssY = SCREEN_H - SS_BOX_H; ssVY = -ssVY; bounced = true; }
   if (bounced) ssColor = randomBounceColor();
 
-  //tft.fillRoundRect((int)ssX, (int)ssY, SS_BOX_W, SS_BOX_H, 8, ssColor);
-  //tft.drawRoundRect((int)ssX, (int)ssY, SS_BOX_W, SS_BOX_H, 8, TFT_WHITE);
 
   scrnSprite.fillRoundRect((int)ssX, (int)ssY, SS_BOX_W, SS_BOX_H, 8, ssColor);
   scrnSprite.drawRoundRect((int)ssX, (int)ssY, SS_BOX_W, SS_BOX_H, 8, TFT_WHITE);
@@ -1357,9 +1350,6 @@ void screensaverTick() {
   struct tm t;
   char hm[8] = "--:--";
   if (getNow(t)) snprintf(hm, sizeof(hm), "%02d:%02d", t.tm_hour, t.tm_min);
-  //tft.setTextDatum(MC_DATUM);
-  //tft.setTextColor(TFT_BLACK, ssColor);
-  //tft.drawString(hm, (int)ssX + SS_BOX_W / 2, (int)ssY + SS_BOX_H / 2, 4);
   
   scrnSprite.setTextDatum(MC_DATUM);
   scrnSprite.setTextColor(TFT_BLACK, ssColor);
