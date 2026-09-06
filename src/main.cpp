@@ -116,6 +116,8 @@
 #define SCREEN_W 320
 #define SCREEN_H 240
 
+
+
 const char * ntpServer = "pool.ntp.org";
 const char * timezone = "GMT0BST,M3.5.0/1,M10.5.0";
 
@@ -137,8 +139,8 @@ int16_t tsMinX = 200, tsMaxX = 3800, tsMinY = 200, tsMaxY = 3800;
 #define COL_BG      TFT_BLACK
 #define COL_PANEL   0x18E3   // dark blue-grey
 #define COL_BTN     0x2965   // slate
-#define COL_BTN_OFF  0x0470   // muted red
-#define COL_BTN_ON 0x7803   // green-ish
+#define COL_BTN_ON  0x0470   // muted red
+#define COL_BTN_OFF 0x7803   // green-ish
 #define COL_TEXT    TFT_WHITE
 #define COL_ACCENT  0xFEA0   // yellow (fits the board!)
 
@@ -1255,7 +1257,7 @@ void setup() {
   tft.setTextColor(COL_TEXT, COL_BG);
   tft.drawString("Connecting WiFi (or setup AP)...", SCREEN_W / 2, SCREEN_H / 2, 2);
 
-  char ver[16];
+  char ver[64];
   snprintf(ver, sizeof(ver), "Firmware: %s", AUTO_VERSION);
 
   tft.drawString(ver,SCREEN_W/2, (SCREEN_H/2)+30,2);
