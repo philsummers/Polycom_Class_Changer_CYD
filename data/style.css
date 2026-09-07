@@ -1,0 +1,15 @@
+body{font-family:Arial,Helvetica,sans-serif;background:#111;color:#eee;margin:0;padding:16px;}
+h1{color:#fea033;font-size:20px;margin:0 0 12px;}
+h2{color:#fea033;font-size:16px;margin:22px 0 8px;}
+.card{background:#182638;border-radius:8px;padding:12px;margin-bottom:10px;}
+.row{display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap;}
+input[type=number]{width:54px;padding:5px;border-radius:4px;border:1px solid #555;background:#0e1a28;color:#eee;}
+input[type=password]{padding:5px;border-radius:4px;border:1px solid #555;background:#0e1a28;color:#eee;}
+button{background:#2c5a80;color:#fff;border:1px solid #789;border-radius:6px;padding:7px 12px;cursor:pointer;font-size:14px;}
+button.danger{background:#802c2c;}
+button.go{background:#1f7a3d;}
+.day{width:30px;height:30px;border-radius:5px;border:1px solid #789;background:#26374a;color:#bbb;
+     display:inline-flex;align-items:center;justify-content:center;cursor:pointer;font-size:13px;user-select:none;}
+.day.on{background:#1f7a3d;color:#fff;border-color:#fff;}
+.muted{color:#889;font-size:12px;}
+label{font-size:14px;}

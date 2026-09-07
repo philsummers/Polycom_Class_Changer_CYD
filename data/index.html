@@ -1,0 +1,33 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bell Scheduler</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<h1>Lesson Bell Scheduler</h1>
+<div class="card" id="status">Loading status...</div>
+
+<h2>Schedule A <button id="enBtnA" onclick="toggleSchedule('A')"></button></h2>
+<div id="listA"></div>
+<div class="card"><b>Add timer</b><div id="addA"></div></div>
+
+<h2>Schedule B <button id="enBtnB" onclick="toggleSchedule('B')"></button></h2>
+<div id="listB"></div>
+<div class="card"><b>Add timer</b><div id="addB"></div></div>
+
+<h2>Bell Test</h2>
+<div class="card row">
+  <button class="go" onclick="testBell('A')">Test Bell A</button>
+  <button class="go" onclick="testBell('B')">Test Bell B</button>
+</div>
+
+<h2>Admin Password</h2>
+<div class="card">
+  <div class="row"><label>Current password</label><input type="password" id="oldPass"></div>
+  <div class="row"><label>New password</label><input type="password" id="newPass"></div>
+  <button onclick="changePassword()">Update Password</button>
+  <div class="muted" id="passMsg"></div>
+</div>
+
+<script src="/app.js"></script>
+</body></html>
