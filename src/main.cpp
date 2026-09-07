@@ -1308,7 +1308,7 @@ uint16_t randomBounceColor() {
 }
 
 void enterScreensaver() {
-  tft.fillScreen(COL_BG);
+  scrnSprite.fillSprite(COL_BG);
   ssX = random(0, SCREEN_W - SS_BOX_W);
   ssY = random(SS_TOP_MARGIN, SCREEN_H - SS_BOX_H);
   ssVX = random(0, 2) ? 1.6 : -1.6;
