@@ -587,6 +587,62 @@ void drawButton(Btn b, const char* label, uint16_t color = COL_BTN) {
   tft.setTextDatum(oldDatum);
 }
 
+// ---------------------------------------------------------------------------
+// Icon buttons
+// ---------------------------------------------------------------------------
+// A handful of simple vector glyphs drawn with plain TFT_eSPI primitives
+// (triangles/rects/circles only - no bitmap assets, no filesystem, nothing
+// that depends on a specific TFT_eSPI version's font/graphics extras). This
+// is a deliberately lighter-weight alternative to pulling in LVGL: a full
+// LVGL migration would mean adding a display/touch driver bridge and
+// rewriting every screen in this file as LVGL widgets - a large, risky
+// rewrite of a ~1700-line sketch for what's fundamentally a cosmetic ask.
+// Icons here are reserved for actions that are near-universally recognized
+// at a glance (back, add, settings) - destructive or easily-confused actions
+// (Save, Delete, Enable/Disable toggles) deliberately keep text labels, since
+// misreading an icon matters more when the action isn't reversible.
+enum IconType { ICON_BACK, ICON_PLUS, ICON_GEAR, ICON_BELL };
+
+void drawIcon(int16_t cx, int16_t cy, int16_t r, IconType icon, uint16_t fg, uint16_t bg) {
+  switch (icon) {
+    case ICON_BACK:
+      tft.fillTriangle(cx - r, cy, cx + r * 0.6, cy - r * 0.8, cx + r * 0.6, cy + r * 0.8, fg);
+      break;
+    case ICON_PLUS: {
+      int16_t t = max((int16_t)2, (int16_t)(r / 2));
+      tft.fillRect(cx - r, cy - t / 2, r * 2, t, fg);
+      tft.fillRect(cx - t / 2, cy - r, t, r * 2, fg);
+      break;
+    }
+    case ICON_GEAR: {
+      tft.fillCircle(cx, cy, r, fg);
+      const int teeth = 8;
+      for (int i = 0; i < teeth; i++) {
+        float ang = i * (2.0 * PI / teeth);
+        int16_t tx = cx + cos(ang) * r * 1.25;
+        int16_t ty = cy + sin(ang) * r * 1.25;
+        tft.fillCircle(tx, ty, r * 0.3, fg);
+      }
+      tft.fillCircle(cx, cy, r * 0.4, bg); // punch the center hole through to the button's own background
+      break;
+    }
+    case ICON_BELL:
+      tft.fillTriangle(cx - r, cy + r * 0.3, cx + r, cy + r * 0.3, cx, cy - r, fg);
+      tft.fillRect(cx - r, cy + r * 0.15, r * 2, r * 0.35, fg);
+      tft.fillCircle(cx, cy + r * 0.65, r * 0.2, fg);
+      break;
+  }
+}
+
+void drawIconButton(Btn b, IconType icon, uint16_t color = COL_BTN) {
+  tft.fillRoundRect(b.x, b.y, b.w, b.h, 6, color);
+  tft.drawRoundRect(b.x, b.y, b.w, b.h, 6, TFT_WHITE);
+  int16_t cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+  int16_t r = (min(b.w, b.h) / 2) - 6;
+  drawIcon(cx, cy, r, icon, TFT_WHITE, color);
+}
+
+
 bool getNow(struct tm &t) {
   time_t now = time(nullptr);
   if (now < 100000) return false; // clock never set
@@ -1016,7 +1072,8 @@ void drawHome() {
   snprintf(bufB, sizeof(bufB), "%d timer(s)", countB);
   tft.drawString(bufB, 175, 88, 2);
 
-  drawButton(btnSettings, "Settings");
+  //drawButton(btnSettings, "Settings");
+  drawIconButton(btnSettings,ICON_GEAR);
   drawButton(btnTestA, "Test A");
   drawButton(btnTestB, "Test B");
 
@@ -1055,8 +1112,10 @@ void drawList() {
     y += 32;
   }
 
-  drawButton(btnBack, "Back");
-  drawButton(btnAdd, "+ Add");
+  //drawButton(btnBack, "Back");
+  drawIconButton(btnBack, ICON_BACK);
+  //drawButton(btnAdd, "+ Add");
+  drawIconButton(btnAdd, ICON_PLUS);
   drawButton(btnPrev, "< Prev");
   drawButton(btnNext, "Next >");
 }
@@ -1102,7 +1161,8 @@ void drawEdit() {
 
   drawButton(btnSave, "Save");
   if (editIndex != -1) drawButton(btnDelete, "Delete", COL_BTN_OFF);
-  drawButton(btnCancel, "Cancel");
+  //drawButton(btnCancel, "Cancel");
+  drawIconButton(btnCancel, ICON_BACK);
 }
 
 Btn btnWifiSetup = {10, 32, 300, 30};
@@ -1144,7 +1204,8 @@ void drawSettings() {
   drawButton(btnHrUp2, "+"); drawButton(btnHrDn2, "-");
   drawButton(btnMinUp2, "+"); drawButton(btnMinDn2, "-");
   drawButton(btnApplyTime, "Apply Time");
-  drawButton(btnSettingsBack, "Back");
+  //drawButton(btnSettingsBack, "Back");
+  drawIconButton(btnSettingsBack, ICON_BACK);
 
   drawButton(btnOpenA, "Edit A");
   drawButton(btnOpenB, "Edit B");
@@ -1271,7 +1332,8 @@ void drawScreensaverSettings() {
   snprintf(note2, sizeof(note2), "touch, or automatically %d min before a due bell.", SCREENSAVER_WAKE_LEAD_MIN);
   tft.drawString(note2, 10, 152, 1);
 
-  drawButton(btnSsBack, "Back");
+  //drawButton(btnSsBack, "Back");
+  drawIconButton(btnSsBack,ICON_BACK);
 }
 
 void handleScreensaverSettingsTouch(int16_t x, int16_t y) {
@@ -1472,7 +1534,8 @@ void drawService() {
   drawButton(btnSvcTestB, "Test Bell B");
   drawButton(btnSvcRestart, "Restart Device");
   drawButton(btnSvcReset, "Factory Reset", COL_BTN_OFF);
-  drawButton(btnSvcBack, "Back");
+  //drawButton(btnSvcBack, "Back");
+  drawIconButton(btnSvcBack, ICON_BACK);
 }
 
 void handleServiceTouch(int16_t x, int16_t y) {
