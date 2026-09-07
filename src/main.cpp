@@ -85,10 +85,14 @@
 #include <esp_wifi.h>
 #include <WiFiUdp.h>
 #include <WiFiManager.h>
+#include <WebServer.h>
 #include <Preferences.h>
 #include <time.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebserver.h>
+#include <LittleFS.h>
+#include <string.h>
+#include <ArduinoJson.h>
 
 #include <ElegantOTA.h>
 
@@ -116,12 +120,22 @@
 #define SCREEN_W 320
 #define SCREEN_H 240
 
+// Admin web interface login. These compile-time values are only the
+// *factory default* - once someone logs in and changes the password via the
+// web page, the new one is stored in flash and these defines are never
+// consulted again. Change ADMIN_PASS_DEFAULT before flashing if you'd
+// rather not ship with a known default, even temporarily.
+#define ADMIN_USER_DEFAULT "admin"
+#define ADMIN_PASS_DEFAULT "changeme123"
+char adminUser[24];
+char adminPass[32];
+
 
 
 const char * ntpServer = "pool.ntp.org";
 const char * timezone = "GMT0BST,M3.5.0/1,M10.5.0";
 
-AsyncWebServer webserver(80);
+AsyncWebServer webserver(8080);
 
 // ---------------------------------------------------------------------------
 // Globals: display + touch
@@ -459,6 +473,12 @@ void loadSchedules() {
   prefs.getBytes("holidays", holidays, sizeof(holidays));
   screensaverEnabled = prefs.getBool("ssEn", true);
   screensaverIdleMinutes = prefs.getUChar("ssMin", 3);
+   {
+    String au = prefs.getString("aUser", ADMIN_USER_DEFAULT);
+    String ap = prefs.getString("aPass", ADMIN_PASS_DEFAULT);
+    au.toCharArray(adminUser, sizeof(adminUser));
+    ap.toCharArray(adminPass, sizeof(adminPass));
+  }
   prefs.end();
   if (countA > MAX_TIMERS) countA = 0;
   if (countB > MAX_TIMERS) countB = 0;
@@ -479,6 +499,8 @@ void saveSchedules() {
   prefs.putBytes("holidays", holidays, sizeof(holidays));
   prefs.putBool("ssEn", screensaverEnabled);
   prefs.putUChar("ssMin", screensaverIdleMinutes);
+  prefs.putString("aUser", adminUser);
+  prefs.putString("aPass", adminPass);
   prefs.end();
 }
 
@@ -729,6 +751,226 @@ void updateHomeClock(bool force) {
     lastHoliday = onHoliday;
   }
 }
+
+// ---------------------------------------------------------------------------
+// ADMIN WEB INTERFACE
+// ---------------------------------------------------------------------------
+// A second, separate web server on port 80 (the check-in server above stays
+// on 8090 and unauthenticated, since it's machine-to-machine on a trusted
+// LAN - this one is human-facing and password protected with HTTP Basic
+// Auth). Deliberately scoped to what's most useful to reach remotely: the
+// two timer schedules (the actual ask), a live status readout, bell tests
+// for wiring checks, and the ability to change the admin password. Term
+// dates, remote-unit assignment, and screensaver settings stay device-only
+// for now - see the extension notes at the end of this file for that.
+#define ADMIN_PORT 80
+WebServer adminServer(ADMIN_PORT);
+
+bool checkAdminAuth() {
+  if (!adminServer.authenticate(adminUser, adminPass)) {
+    adminServer.requestAuthentication();
+    return false;
+  }
+  return true;
+}
+
+// The web page's HTML/CSS/JS used to be embedded here as a PROGMEM string,
+// which counts against the sketch's compiled program-storage size. It now
+// lives as plain files (index.html, style.css, app.js) on the ESP32's
+// LittleFS partition instead - a separate flash region that isn't part of
+// the firmware binary at all, so none of it counts toward "Sketch uses X%
+// of program storage space." This is the only approach that actually
+// reduces that figure; splitting the .ino into more tabs/files would not,
+// since the Arduino IDE compiles everything in a sketch folder together
+// into one binary regardless of how many files it's split across.
+//
+// SETTING THIS UP (one-time, separate from flashing the sketch)
+// 1. Put index.html, style.css, and app.js in a folder named "data" next to
+//    this .ino file (Arduino requires that exact folder name and location).
+// 2. Upload that folder to the device's filesystem partition - this is a
+//    SEPARATE step from uploading the sketch:
+//      - Arduino IDE 1.8.x: install the "ESP32 Sketch Data Upload" tool,
+//        then Tools -> ESP32 Sketch Data Upload.
+//      - Arduino IDE 2.x: that old tool doesn't work the same way - install
+//        the community "arduino-littlefs-upload" plugin instead (search
+//        that name), which adds the same option to the command palette.
+//      - PlatformIO: use "Upload Filesystem Image" - no plugin needed.
+// 3. The existing "Default 4MB with spiffs" partition scheme (already
+//    noted in BOARD SETTINGS above) has a filesystem partition big enough
+//    for these files with plenty of room to spare - no change needed there.
+// If you forget this step, the web page will show a clear message telling
+// you to do it, rather than a bare 404.
+bool serveAdminFile(const char* path, const char* contentType) {
+  if (!checkAdminAuth()) return true; // auth challenge already sent
+  if (!SPIFFS.exists(path)) {
+    adminServer.send(500, "text/plain",
+      String("Web UI file not found on LittleFS: ") + path +
+      "\n\nUpload the sketch's 'data' folder to the device's filesystem "
+      "partition (Tools > ESP32 Sketch Data Upload on Arduino IDE 1.8.x, "
+      "or the arduino-littlefs-upload plugin on Arduino IDE 2.x). See the "
+      "comment above serveAdminFile() in bell_scheduler.ino for details.");
+    return true;
+  }
+  File f = SPIFFS.open(path, "r");
+  adminServer.streamFile(f, contentType);
+  f.close();
+  return true;
+}
+
+void handleAdminRoot() { serveAdminFile("/index.html", "text/html"); }
+void handleAdminCss()  { serveAdminFile("/style.css", "text/css"); }
+void handleAdminJs()   { serveAdminFile("/app.js", "application/javascript"); }
+
+void handleApiStatus() {
+  if (!checkAdminAuth()) return;
+  DynamicJsonDocument doc(512);
+  struct tm t;
+  char timeStr[40] = "clock not set";
+  if (getNow(t)) strftime(timeStr, sizeof(timeStr), "%H:%M:%S %a %d %b %Y", &t);
+  doc["time"] = timeStr;
+  unsigned long upSec = millis() / 1000;
+  char upStr[24];
+  snprintf(upStr, sizeof(upStr), "%luh %02lum", upSec / 3600, (upSec / 60) % 60);
+  doc["uptime"] = upStr;
+  doc["heap"] = (unsigned long)ESP.getFreeHeap();
+  doc["wifi"] = WiFi.status() == WL_CONNECTED ? WiFi.SSID() : String("not connected");
+  doc["rssi"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
+  doc["ip"] = WiFi.localIP().toString();
+  String out;
+  serializeJson(doc, out);
+  adminServer.send(200, "application/json", out);
+}
+
+void handleApiScheduleGet() {
+  if (!checkAdminAuth()) return;
+  DynamicJsonDocument doc(8192);
+  doc["enabledA"] = scheduleAEnabled;
+  doc["enabledB"] = scheduleBEnabled;
+  JsonArray a = doc.createNestedArray("a");
+  for (int i = 0; i < countA; i++) {
+    JsonObject o = a.createNestedObject();
+    o["i"] = i; o["h"] = scheduleA[i].hour; o["m"] = scheduleA[i].minute;
+    o["en"] = (bool)scheduleA[i].enabled; o["days"] = scheduleA[i].days;
+  }
+  JsonArray b = doc.createNestedArray("b");
+  for (int i = 0; i < countB; i++) {
+    JsonObject o = b.createNestedObject();
+    o["i"] = i; o["h"] = scheduleB[i].hour; o["m"] = scheduleB[i].minute;
+    o["en"] = (bool)scheduleB[i].enabled; o["days"] = scheduleB[i].days;
+  }
+  String out;
+  serializeJson(doc, out);
+  adminServer.send(200, "application/json", out);
+}
+
+void handleApiTimerPost() {
+  if (!checkAdminAuth()) return;
+  DynamicJsonDocument doc(512);
+  if (deserializeJson(doc, adminServer.arg("plain"))) {
+    adminServer.send(400, "application/json", "{\"ok\":false,\"error\":\"bad json\"}");
+    return;
+  }
+  const char* schedStr = doc["sched"] | "A";
+  int idx = doc["i"] | -1;
+  int h = constrain((int)(doc["h"] | 8), 0, 23);
+  int m = constrain((int)(doc["m"] | 0), 0, 59);
+  bool en = doc["en"] | true;
+  uint8_t days = (uint8_t)(doc["days"] | DAYS_ALL_WEEKDAYS) & 0x1F;
+
+  TimerEntry* arr = (schedStr[0] == 'A') ? scheduleA : scheduleB;
+  uint8_t* count = (schedStr[0] == 'A') ? &countA : &countB;
+  TimerEntry te = { (uint8_t)(en ? 1 : 0), (uint8_t)h, (uint8_t)m, days };
+
+  if (idx < 0) {
+    if (*count >= MAX_TIMERS) {
+      adminServer.send(400, "application/json", "{\"ok\":false,\"error\":\"schedule is full\"}");
+      return;
+    }
+    arr[*count] = te; (*count)++;
+  } else {
+    if (idx >= *count) {
+      adminServer.send(400, "application/json", "{\"ok\":false,\"error\":\"bad index\"}");
+      return;
+    }
+    arr[idx] = te;
+  }
+  sortSchedule(arr, *count);
+  saveSchedules();
+  adminServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleApiTimerDelete() {
+  if (!checkAdminAuth()) return;
+  DynamicJsonDocument doc(256);
+  if (deserializeJson(doc, adminServer.arg("plain"))) {
+    adminServer.send(400, "application/json", "{\"ok\":false,\"error\":\"bad json\"}");
+    return;
+  }
+  const char* schedStr = doc["sched"] | "A";
+  int idx = doc["i"] | -1;
+  TimerEntry* arr = (schedStr[0] == 'A') ? scheduleA : scheduleB;
+  uint8_t* count = (schedStr[0] == 'A') ? &countA : &countB;
+  if (idx < 0 || idx >= *count) {
+    adminServer.send(400, "application/json", "{\"ok\":false,\"error\":\"bad index\"}");
+    return;
+  }
+  for (int i = idx; i < (*count) - 1; i++) arr[i] = arr[i + 1];
+  (*count)--;
+  saveSchedules();
+  adminServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleApiScheduleEnable() {
+  if (!checkAdminAuth()) return;
+  DynamicJsonDocument doc(128);
+  if (deserializeJson(doc, adminServer.arg("plain"))) {
+    adminServer.send(400, "application/json", "{\"ok\":false,\"error\":\"bad json\"}");
+    return;
+  }
+  const char* schedStr = doc["sched"] | "A";
+  bool en = doc["en"] | true;
+  if (schedStr[0] == 'A') scheduleAEnabled = en; else scheduleBEnabled = en;
+  saveSchedules();
+  adminServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleApiBellTest() {
+  if (!checkAdminAuth()) return;
+  DynamicJsonDocument doc(128);
+  if (deserializeJson(doc, adminServer.arg("plain"))) {
+    adminServer.send(400, "application/json", "{\"ok\":false,\"error\":\"bad json\"}");
+    return;
+  }
+  const char* schedStr = doc["sched"] | "A";
+  if (schedStr[0] == 'A') triggerBellA(); else triggerBellB();
+  adminServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleApiPassword() {
+  if (!checkAdminAuth()) return;
+  DynamicJsonDocument doc(256);
+  if (deserializeJson(doc, adminServer.arg("plain"))) {
+    adminServer.send(400, "application/json", "{\"ok\":false,\"error\":\"bad json\"}");
+    return;
+  }
+  const char* oldPass = doc["oldPass"] | "";
+  const char* newPass = doc["newPass"] | "";
+  if (strcmp(oldPass, adminPass) != 0) {
+    adminServer.send(403, "application/json", "{\"ok\":false,\"error\":\"current password is incorrect\"}");
+    return;
+  }
+  if (strlen(newPass) < 4) {
+    adminServer.send(400, "application/json", "{\"ok\":false,\"error\":\"new password must be at least 4 characters\"}");
+    return;
+  }
+  strncpy(adminPass, newPass, sizeof(adminPass) - 1);
+  adminPass[sizeof(adminPass) - 1] = '\0';
+  saveSchedules();
+  adminServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+
+
 
 // ---------------------------------------------------------------------------
 // Screen: HOME
@@ -1397,6 +1639,7 @@ void initWebServer() {
 
 void setup() {
   Serial.begin(115200);
+  randomSeed(esp_random());
 
   pinMode(BELL_A_PIN, OUTPUT); digitalWrite(BELL_A_PIN, LOW);
   pinMode(BELL_B_PIN, OUTPUT); digitalWrite(BELL_B_PIN, LOW);
@@ -1468,6 +1711,18 @@ void setup() {
 
   initWebServer();
 
+  adminServer.on("/", HTTP_GET, handleAdminRoot);
+  adminServer.on("/style.css", HTTP_GET, handleAdminCss);
+  adminServer.on("/app.js", HTTP_GET, handleAdminJs);
+  adminServer.on("/api/status", HTTP_GET, handleApiStatus);
+  adminServer.on("/api/schedule", HTTP_GET, handleApiScheduleGet);
+  adminServer.on("/api/timer", HTTP_POST, handleApiTimerPost);
+  adminServer.on("/api/timer/delete", HTTP_POST, handleApiTimerDelete);
+  adminServer.on("/api/schedule/enable", HTTP_POST, handleApiScheduleEnable);
+  adminServer.on("/api/bell/test", HTTP_POST, handleApiBellTest);
+  adminServer.on("/api/password", HTTP_POST, handleApiPassword);
+  adminServer.begin();
+
   currentScreen = SCR_HOME;
   drawHome();
   lastActivityMillis = millis(); // start the idle clock from here, not from cold boot
@@ -1491,6 +1746,7 @@ void loop() {
   checkSchedules();
   handleTouch();
   serviceMenuTick();
+  adminServer.handleClient();
   screensaverTick();
 
   if (currentScreen == SCR_HOME) {
