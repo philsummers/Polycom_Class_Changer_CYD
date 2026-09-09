@@ -76,8 +76,7 @@
   ============================================================================
 */
 
-#include <SPIFFS.h>
-#include <FS.h>
+#include <LittleFS.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
@@ -90,7 +89,6 @@
 #include <time.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebserver.h>
-#include <LittleFS.h>
 #include <string.h>
 #include <ArduinoJson.h>
 #include <esp_task_wdt.h>
@@ -766,7 +764,7 @@ bool checkAdminAuth() {
 // you to do it, rather than a bare 404.
 bool serveAdminFile(const char* path, const char* contentType) {
   if (!checkAdminAuth()) return true; // auth challenge already sent
-  if (!SPIFFS.exists(path)) {
+  if (!LittleFS.exists(path)) {
     adminServer.send(500, "text/plain",
       String("Web UI file not found on LittleFS: ") + path +
       "\n\nUpload the sketch's 'data' folder to the device's filesystem "
@@ -775,7 +773,7 @@ bool serveAdminFile(const char* path, const char* contentType) {
       "comment above serveAdminFile() in bell_scheduler.ino for details.");
     return true;
   }
-  File f = SPIFFS.open(path, "r");
+  File f = LittleFS.open(path, "r");
   adminServer.streamFile(f, contentType);
   f.close();
   return true;

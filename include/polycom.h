@@ -1,7 +1,6 @@
 
 #include <Arduino.h>
-#include <SPIFFS.h>
-#include <FS.h>
+#include <LittleFS.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <WiFiUdp.h>

@@ -204,12 +204,12 @@ void polycomSetup() {
     populateSerial();
 
     udp.begin(port);
-    if(!SPIFFS.begin(true)) {
-        Serial.println("SPIFFS failed");        
+    if(!LittleFS.begin(true)) {
+        Serial.println("LittleFS failed");        
         return;
     }
 
-    wavFile = SPIFFS.open("/pager-bell.wav","r");
+    wavFile = LittleFS.open("/pager-bell.wav","r");
 
     if(!wavFile) {
         Serial.println("WAV missing");        
