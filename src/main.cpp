@@ -945,7 +945,7 @@ void handleApiPassword() {
 // Screen: HOME
 // ---------------------------------------------------------------------------
 Btn btnSettings= {10, 200, 90, 32};
-Btn btnTestA   = {110, 200, 90, 32};
+Btn btnTestA   = {120, 200, 90, 32};
 Btn btnTestB   = {220, 200, 90, 32};
 
 Btn btnBack     = {10, 200, 70, 32};
@@ -1674,7 +1674,7 @@ void screensaverTick() {
   
   scrnSprite.setTextDatum(MC_DATUM);
   scrnSprite.setTextColor(TFT_BLACK, ssColor);
-  scrnSprite.drawString(hm, (int)ssX + SS_BOX_W / 2, (int)ssY + SS_BOX_H / 2, 4);
+  scrnSprite.drawString(hm, (int)ssX + SS_BOX_W / 2, ((int)ssY + SS_BOX_H / 2) + 4, 4);
 
   //scrnSprite.pushSprite(0,0);
 }
