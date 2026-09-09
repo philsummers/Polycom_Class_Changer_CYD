@@ -93,6 +93,7 @@
 #include <LittleFS.h>
 #include <string.h>
 #include <ArduinoJson.h>
+#include <esp_task_wdt.h>
 
 #include <ElegantOTA.h>
 
@@ -118,6 +119,15 @@
 #define TS_MAXX 3800
 #define TS_MINY 200
 #define TS_MAXY 3800
+
+// Backlight dimming (idle power-saving / screen-protection). Must match
+// TFT_BL in TFT_eSPI's User_Setup.h - this takes over that same pin with
+// PWM instead of a plain on/off digitalWrite, so the backlight can be
+// smoothly dimmed rather than only switched fully on or off.
+#define TFT_BL_PIN 21
+#define BACKLIGHT_PWM_CHANNEL 0
+#define BACKLIGHT_PWM_FREQ_HZ 5000
+#define BACKLIGHT_PWM_RES_BITS 8
 
 #define SCREEN_W 320
 #define SCREEN_H 240
@@ -157,8 +167,8 @@ int16_t tsMinX = 200, tsMaxX = 3800, tsMinY = 200, tsMaxY = 3800;
 #define COL_BG      TFT_BLACK
 #define COL_PANEL   0x18E3   // dark blue-grey
 #define COL_BTN     0x2965   // slate
-#define COL_BTN_ON  0x0470   // muted red
-#define COL_BTN_OFF 0x7803   // green-ish
+#define COL_BTN_ON  TFT_GREENYELLOW //0x0470   // green-ish
+#define COL_BTN_OFF 0x7803   // muted-red
 #define COL_TEXT    TFT_WHITE
 #define COL_ACCENT  0xFEA0   // yellow (fits the board!)
 
@@ -227,6 +237,14 @@ uint8_t screensaverIdleMinutes = 3;
 unsigned long lastActivityMillis = 0;
 #define SCREENSAVER_WAKE_LEAD_MIN 5 // wake automatically this many minutes before a due bell
 
+// Backlight dimming shares the same idle timer and wake conditions as the
+// screensaver above (any touch, or a bell due soon), but is independently
+// switchable - some installs may want dimming without the bouncing clock,
+// or vice versa. Declared here for the same forward-reference reasons.
+bool dimEnabled = true;
+uint8_t dimLevelPercent = 20; // 5-100, applied as backlight PWM duty when idle
+bool isDimmed = false;
+
 
 struct Btn { int16_t x, y, w, h; };
 
@@ -253,6 +271,8 @@ int holEditIndex = -1; // -1 = adding a new range
 HolidayRange holEditBuffer;
 const int HOL_ROWS_PER_PAGE = 5;
 
+void drawWifiIcon(bool force);
+
 // ---------------------------------------------------------------------------
 // Persistence
 // ---------------------------------------------------------------------------
@@ -273,6 +293,8 @@ void loadSchedules() {
   prefs.getBytes("holidays", holidays, sizeof(holidays));
   screensaverEnabled = prefs.getBool("ssEn", true);
   screensaverIdleMinutes = prefs.getUChar("ssMin", 3);
+  dimEnabled = prefs.getBool("dimEn", true);
+  dimLevelPercent = prefs.getUChar("dimPct", 20);
    {
     String au = prefs.getString("aUser", ADMIN_USER_DEFAULT);
     String ap = prefs.getString("aPass", ADMIN_PASS_DEFAULT);
@@ -284,6 +306,7 @@ void loadSchedules() {
   if (countB > MAX_TIMERS) countB = 0;
   if (holidayCount > MAX_HOLIDAYS) holidayCount = 0;
   if (screensaverIdleMinutes < 1 || screensaverIdleMinutes > 30) screensaverIdleMinutes = 3;
+  if (dimLevelPercent < 5 || dimLevelPercent > 100) dimLevelPercent = 20;
 }
 
 void saveSchedules() {
@@ -299,6 +322,8 @@ void saveSchedules() {
   prefs.putBytes("holidays", holidays, sizeof(holidays));
   prefs.putBool("ssEn", screensaverEnabled);
   prefs.putUChar("ssMin", screensaverIdleMinutes);
+  prefs.putBool("dimEn", dimEnabled);
+  prefs.putUChar("dimPct", dimLevelPercent);
   prefs.putString("aUser", adminUser);
   prefs.putString("aPass", adminPass);
   prefs.end();
@@ -378,13 +403,61 @@ bool hit(Btn b, int16_t x, int16_t y) {
 }
 
 void drawButton(Btn b, const char* label, uint16_t color = COL_BTN) {
-  int oldDatum = tft.getTextDatum();
-  tft.fillRoundRect(b.x, b.y, b.w, b.h, 6, color);
-  tft.drawRoundRect(b.x, b.y, b.w, b.h, 6, TFT_WHITE);
-  tft.setTextColor(COL_TEXT, color);
-  tft.setTextDatum(MC_DATUM);
-  tft.drawString(label, b.x + b.w / 2, b.y + b.h / 2 + 1, 2);
-  tft.setTextDatum(oldDatum);
+  int oldDatum = scrnSprite.getTextDatum();
+  scrnSprite.fillRoundRect(b.x, b.y, b.w, b.h, 6, color);
+  scrnSprite.drawRoundRect(b.x, b.y, b.w, b.h, 6, TFT_WHITE);
+  scrnSprite.setTextColor(COL_TEXT, color);
+  scrnSprite.setTextDatum(MC_DATUM);
+  scrnSprite.drawString(label, b.x + b.w / 2, b.y + b.h / 2 + 1, 2);
+  scrnSprite.setTextDatum(oldDatum);
+}
+
+void drawButton(Btn b, const char* label, uint16_t color, uint16_t text_color) {
+  int oldDatum = scrnSprite.getTextDatum();
+  scrnSprite.fillRoundRect(b.x, b.y, b.w, b.h, 6, color);
+  scrnSprite.drawRoundRect(b.x, b.y, b.w, b.h, 6, TFT_WHITE);
+  scrnSprite.setTextColor(text_color, color);
+  scrnSprite.setTextDatum(MC_DATUM);
+  scrnSprite.drawString(label, b.x + b.w / 2, b.y + b.h / 2 + 1, 2);
+  scrnSprite.setTextDatum(oldDatum);
+}
+
+// ---------------------------------------------------------------------------
+// WATCHDOG TIMER
+// ---------------------------------------------------------------------------
+// If the main loop() ever stops coming back around - a library edge case, a
+// bug, anything - this device would otherwise sit there silently not
+// ringing bells until someone notices and power-cycles it. The ESP32's
+// built-in Task Watchdog Timer (TWDT) fixes that: it's fed once per loop()
+// iteration, and if WDT_TIMEOUT_SEC passes with no feed, the chip panics
+// and reboots itself automatically.
+//
+// WDT_TIMEOUT_SEC is deliberately generous - every genuinely blocking call
+// in normal operation (a remote bell trigger's network timeout, a check-in
+// request, an mDNS lookup) finishes in well under a second, so 15s leaves
+// huge headroom before this could ever misfire during ordinary use.
+//
+// One call in this sketch is a legitimate, intentional exception: the
+// WiFi reconfigure portal (Settings -> Set Up WiFi) can block for up to
+// 180 seconds while you're physically typing a WiFi password into your
+// phone. That call explicitly unsubscribes from the watchdog first and
+// resubscribes after (search for "esp_task_wdt_delete" below) - the boot
+// time WiFi connect in setup() doesn't need the same treatment since the
+// watchdog isn't started until after it's already finished.
+//
+// COMPATIBILITY NOTE: this uses the esp_task_wdt_init(seconds, panic) form
+// that's standard on arduino-esp32 core 2.x (still the default/stable
+// channel most Arduino IDE installs use). Core 3.x (ESP-IDF 5-based)
+// changed that one function's signature to take an esp_task_wdt_config_t
+// struct instead and auto-starts its own default watchdog at boot - if
+// you're on core 3.x and this fails to compile, replace the init line
+// below with esp_task_wdt_reconfigure(&cfg) using that struct; everything
+// else here (add/reset/delete) is unchanged across both core versions.
+#define WDT_TIMEOUT_SEC 15
+
+void startWatchdog() {
+  esp_task_wdt_init(WDT_TIMEOUT_SEC, true); // true = panic (reboot) on timeout, not just warn
+  esp_task_wdt_add(NULL);                   // subscribe the current (loop) task
 }
 
 // ---------------------------------------------------------------------------
@@ -401,42 +474,75 @@ void drawButton(Btn b, const char* label, uint16_t color = COL_BTN) {
 // at a glance (back, add, settings) - destructive or easily-confused actions
 // (Save, Delete, Enable/Disable toggles) deliberately keep text labels, since
 // misreading an icon matters more when the action isn't reversible.
-enum IconType { ICON_BACK, ICON_PLUS, ICON_GEAR, ICON_BELL };
+enum IconType { ICON_BACK, ICON_PLUS, ICON_GEAR, ICON_BELL, ICON_WIFI };
 
 void drawIcon(int16_t cx, int16_t cy, int16_t r, IconType icon, uint16_t fg, uint16_t bg) {
   switch (icon) {
     case ICON_BACK:
-      tft.fillTriangle(cx - r, cy, cx + r * 0.6, cy - r * 0.8, cx + r * 0.6, cy + r * 0.8, fg);
+      scrnSprite.fillTriangle(cx - r, cy, cx + r * 0.6, cy - r * 0.8, cx + r * 0.6, cy + r * 0.8, fg);
       break;
     case ICON_PLUS: {
       int16_t t = max((int16_t)2, (int16_t)(r / 2));
-      tft.fillRect(cx - r, cy - t / 2, r * 2, t, fg);
-      tft.fillRect(cx - t / 2, cy - r, t, r * 2, fg);
+      scrnSprite.fillRect(cx - r, cy - t / 2, r * 2, t, fg);
+      scrnSprite.fillRect(cx - t / 2, cy - r, t, r * 2, fg);
       break;
     }
     case ICON_GEAR: {
-      tft.fillCircle(cx, cy, r, fg);
+      scrnSprite.fillCircle(cx, cy, r, fg);
       const int teeth = 8;
       for (int i = 0; i < teeth; i++) {
         float ang = i * (2.0 * PI / teeth);
         int16_t tx = cx + cos(ang) * r * 1.25;
         int16_t ty = cy + sin(ang) * r * 1.25;
-        tft.fillCircle(tx, ty, r * 0.3, fg);
+        scrnSprite.fillCircle(tx, ty, r * 0.3, fg);
       }
-      tft.fillCircle(cx, cy, r * 0.4, bg); // punch the center hole through to the button's own background
+      scrnSprite.fillCircle(cx, cy, r * 0.4, bg); // punch the center hole through to the button's own background
       break;
     }
-    case ICON_BELL:
-      tft.fillTriangle(cx - r, cy + r * 0.3, cx + r, cy + r * 0.3, cx, cy - r, fg);
-      tft.fillRect(cx - r, cy + r * 0.15, r * 2, r * 0.35, fg);
-      tft.fillCircle(cx, cy + r * 0.65, r * 0.2, fg);
+    case ICON_BELL: {
+      scrnSprite.fillTriangle(cx - r, cy + r * 0.3, cx + r, cy + r * 0.3, cx, cy - r, fg);
+      scrnSprite.fillRect(cx - r, cy + r * 0.15, r * 2, r * 0.35, fg);
+      scrnSprite.fillCircle(cx, cy + r * 0.65, r * 0.2, fg);
       break;
+    }
+    case ICON_WIFI: {
+      // ascending signal bars rather than the classic radiating arcs - just
+      // as recognizable at this size, and only needs fillRect (no drawArc,
+      // which behaves slightly differently across TFT_eSPI versions).
+      const int bars = 4;
+      int16_t barW = max((int16_t)2, (int16_t)(r / 2));
+      int16_t gap = 2;
+      int16_t totalW = bars * barW + (bars - 1) * gap;
+      int16_t startX = cx - totalW / 2;
+      int16_t baseY = cy + r;
+      //int16_t quality = (2 * (WiFi.RSSI() + 100)) % 4;
+      int quality;
+      int rssi = WiFi.RSSI();
+      if (rssi > -50) {
+        quality = 4;
+      } else if (rssi > -62) {
+        quality = 3;
+      } else if (rssi > -68) {
+        quality = 2;
+      } else if (rssi > -79) {
+        quality = 1;
+      } else {
+        quality = 0;
+      }
+
+      for (int i = 0; i < bars; i++) {
+        int16_t barH = (r * 0.7) + i * (r * 0.55);
+        int16_t bx = startX + i * (barW + gap);
+        scrnSprite.fillRect(bx, baseY - barH, barW, barH, (i <= quality) ? fg : TFT_LIGHTGREY);
+      }
+      break;
+    }
   }
 }
 
 void drawIconButton(Btn b, IconType icon, uint16_t color = COL_BTN) {
-  tft.fillRoundRect(b.x, b.y, b.w, b.h, 6, color);
-  tft.drawRoundRect(b.x, b.y, b.w, b.h, 6, TFT_WHITE);
+  scrnSprite.fillRoundRect(b.x, b.y, b.w, b.h, 6, color);
+  scrnSprite.drawRoundRect(b.x, b.y, b.w, b.h, 6, TFT_WHITE);
   int16_t cx = b.x + b.w / 2, cy = b.y + b.h / 2;
   int16_t r = (min(b.w, b.h) / 2) - 6;
   drawIcon(cx, cy, r, icon, TFT_WHITE, color);
@@ -568,8 +674,10 @@ void updateHomeClock(bool force) {
   struct tm t;
   char line1[32], line2[64];
 
+  drawWifiIcon(true);
+
   if (getNow(t)) {
-    strftime(line1, sizeof(line1), "%H:%M:%S   %a %d %b %Y", &t);
+    strftime(line1, sizeof(line1), "%a %d %b %Y   %H:%M:%S", &t);
   } else {
     snprintf(line1, sizeof(line1), "-- clock not set --");
   }
@@ -593,16 +701,16 @@ void updateHomeClock(bool force) {
   }
 
   if (force || strcmp(line1, lastLine1) != 0) {
-    tft.fillRect(0, 125, SCREEN_W, 16, COL_BG);
-    tft.setTextDatum(TC_DATUM);
-    tft.setTextColor(COL_TEXT, COL_BG);
-    tft.drawString(line1, SCREEN_W / 2, 125, 4);
+    scrnSprite.fillRect(0, 125, SCREEN_W, 16, COL_BG);
+    scrnSprite.setTextDatum(TC_DATUM);
+    scrnSprite.setTextColor(COL_TEXT, COL_BG);
+    scrnSprite.drawString(line1, SCREEN_W / 2, 125, 4);
     strcpy(lastLine1, line1);
   }
   if (force || strcmp(line2, lastLine2) != 0 || onHoliday != lastHoliday) {
-    tft.fillRect(0, 161, SCREEN_W, 14, COL_BG);
-    tft.setTextColor(onHoliday ? TFT_RED : COL_TEXT, COL_BG);
-    tft.drawString(line2, SCREEN_W / 2, 161, 2);
+    scrnSprite.fillRect(0, 161, SCREEN_W, 14, COL_BG);
+    scrnSprite.setTextColor(onHoliday ? TFT_RED : COL_TEXT, COL_BG);
+    scrnSprite.drawString(line2, SCREEN_W / 2, 161, 2);
     strcpy(lastLine2, line2);
     lastHoliday = onHoliday;
   }
@@ -679,7 +787,8 @@ void handleAdminJs()   { serveAdminFile("/app.js", "application/javascript"); }
 
 void handleApiStatus() {
   if (!checkAdminAuth()) return;
-  DynamicJsonDocument doc(512);
+  //DynamicJsonDocument doc(512);
+  JsonDocument doc;
   struct tm t;
   char timeStr[40] = "clock not set";
   if (getNow(t)) strftime(timeStr, sizeof(timeStr), "%H:%M:%S %a %d %b %Y", &t);
@@ -699,7 +808,8 @@ void handleApiStatus() {
 
 void handleApiScheduleGet() {
   if (!checkAdminAuth()) return;
-  DynamicJsonDocument doc(8192);
+  //DynamicJsonDocument doc(8192);
+  JsonDocument doc;
   doc["enabledA"] = scheduleAEnabled;
   doc["enabledB"] = scheduleBEnabled;
   JsonArray a = doc.createNestedArray("a");
@@ -721,7 +831,8 @@ void handleApiScheduleGet() {
 
 void handleApiTimerPost() {
   if (!checkAdminAuth()) return;
-  DynamicJsonDocument doc(512);
+  //DynamicJsonDocument doc(512);
+  JsonDocument doc;
   if (deserializeJson(doc, adminServer.arg("plain"))) {
     adminServer.send(400, "application/json", "{\"ok\":false,\"error\":\"bad json\"}");
     return;
@@ -757,7 +868,8 @@ void handleApiTimerPost() {
 
 void handleApiTimerDelete() {
   if (!checkAdminAuth()) return;
-  DynamicJsonDocument doc(256);
+  //DynamicJsonDocument doc(256);
+  JsonDocument doc;
   if (deserializeJson(doc, adminServer.arg("plain"))) {
     adminServer.send(400, "application/json", "{\"ok\":false,\"error\":\"bad json\"}");
     return;
@@ -778,7 +890,8 @@ void handleApiTimerDelete() {
 
 void handleApiScheduleEnable() {
   if (!checkAdminAuth()) return;
-  DynamicJsonDocument doc(128);
+  //DynamicJsonDocument doc(128);
+  JsonDocument doc;
   if (deserializeJson(doc, adminServer.arg("plain"))) {
     adminServer.send(400, "application/json", "{\"ok\":false,\"error\":\"bad json\"}");
     return;
@@ -792,7 +905,8 @@ void handleApiScheduleEnable() {
 
 void handleApiBellTest() {
   if (!checkAdminAuth()) return;
-  DynamicJsonDocument doc(128);
+  //DynamicJsonDocument doc(128);
+  JsonDocument doc;
   if (deserializeJson(doc, adminServer.arg("plain"))) {
     adminServer.send(400, "application/json", "{\"ok\":false,\"error\":\"bad json\"}");
     return;
@@ -804,7 +918,8 @@ void handleApiBellTest() {
 
 void handleApiPassword() {
   if (!checkAdminAuth()) return;
-  DynamicJsonDocument doc(256);
+  //DynamicJsonDocument doc(256);
+  JsonDocument doc;
   if (deserializeJson(doc, adminServer.arg("plain"))) {
     adminServer.send(400, "application/json", "{\"ok\":false,\"error\":\"bad json\"}");
     return;
@@ -843,41 +958,55 @@ Btn btnToggleEn = {SCREEN_W - 110, 4, 100, 26};
 Btn rowBtns[ROWS_PER_PAGE];
 
 
-void drawHome() {
-  tft.fillScreen(COL_BG);
-  tft.setTextColor(COL_ACCENT, COL_BG);
-  tft.setTextDatum(TC_DATUM);
-  tft.drawString("Bell Scheduler", SCREEN_W / 2, 6, 4);
+void drawWifiIcon(bool force) {
+  static int lastState = -1; // -1 = never drawn, 0 = disconnected, 1 = connected
+  int state = (WiFi.status() == WL_CONNECTED) ? 1 : 0;
+  if (!force && state == lastState) return; // avoid needless redraws every poll
+  lastState = state;
+  scrnSprite.fillRect(SCREEN_W - 32, 2, 30, 26, COL_BG); // clear the corner first - bars vary in height
+  drawIcon(SCREEN_W - 18, 16, 10, ICON_WIFI, state ? TFT_GREEN : TFT_RED, COL_BG);
+}
 
-  tft.setTextColor(WiFi.status() == WL_CONNECTED ? TFT_GREEN : TFT_RED, COL_BG);
-  tft.setTextDatum(TR_DATUM);
-  tft.drawString(WiFi.status() == WL_CONNECTED ? "WiFi OK" : "WiFi --", SCREEN_W - 6, 6, 2);
+void drawHome() {
+  scrnSprite.fillSprite(COL_BG);
+  scrnSprite.setTextColor(COL_ACCENT, COL_BG);
+  scrnSprite.setTextDatum(TC_DATUM);
+  scrnSprite.drawString("Bell Scheduler", SCREEN_W / 2, 6, 4);
+
+  //tft.setTextColor(WiFi.status() == WL_CONNECTED ? TFT_GREEN : TFT_RED, COL_BG);
+  //tft.setTextDatum(TR_DATUM);
+  //tft.drawString(WiFi.status() == WL_CONNECTED ? "WiFi OK" : "WiFi --", SCREEN_W - 6, 6, 2);
+  drawWifiIcon(true);
 
   // Panel A
-  tft.fillRoundRect(10, 40, 125, 82, 6, COL_PANEL);
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(COL_TEXT, COL_PANEL);
-  tft.drawString("Schedule A", 20, 48, 2);
-  tft.drawString(scheduleAEnabled ? "ENABLED" : "disabled", 20, 68, 2);
+  scrnSprite.fillRoundRect(10, 40, 125, 68, 6, scheduleAEnabled ? COL_BTN_ON : COL_BTN_OFF);
+  scrnSprite.setTextDatum(TL_DATUM);
+  scrnSprite.setTextColor(scheduleAEnabled ? TFT_BLACK : TFT_WHITE, scheduleAEnabled ? COL_BTN_ON : COL_BTN_OFF);
+  scrnSprite.drawString("Schedule A", 20, 48, 2);
+  scrnSprite.drawString(scheduleAEnabled ? "ENABLED" : "disabled", 20, 68, 2);
   
   char bufA[24];
   snprintf(bufA, sizeof(bufA), "%d timer(s)", countA);
-  tft.drawString(bufA, 20, 88, 2);
+  scrnSprite.drawString(bufA, 20, 88, 2);
 
   // Panel B
-  tft.fillRoundRect(165, 40, 125, 82, 6, COL_PANEL);
-  tft.drawString("Schedule B", 175, 48, 2);
-  tft.drawString(scheduleBEnabled ? "ENABLED" : "disabled", 175, 68, 2);
+  scrnSprite.fillRoundRect(185, 40, 125, 68, 6, scheduleBEnabled ? COL_BTN_ON : COL_BTN_OFF);
+  scrnSprite.setTextColor(scheduleBEnabled ? TFT_BLACK : TFT_WHITE, scheduleBEnabled ? COL_BTN_ON : COL_BTN_OFF);
+  scrnSprite.drawString("Schedule B", 195, 48, 2);
+  scrnSprite.drawString(scheduleBEnabled ? "ENABLED" : "disabled", 195, 68, 2);
   char bufB[24];
   snprintf(bufB, sizeof(bufB), "%d timer(s)", countB);
-  tft.drawString(bufB, 175, 88, 2);
+  scrnSprite.drawString(bufB, 195, 88, 2);
 
   //drawButton(btnSettings, "Settings");
   drawIconButton(btnSettings,ICON_GEAR);
+  //drawIconButton(btnTestA,ICON_BELL);
   drawButton(btnTestA, "Test A");
   drawButton(btnTestB, "Test B");
 
   updateHomeClock(true);
+  //scrnSprite.pushSprite(0,0);
+
 }
 
 void drawList() {
@@ -885,13 +1014,13 @@ void drawList() {
   uint8_t count   = (activeSchedule == 0) ? countA : countB;
   bool &enabled   = (activeSchedule == 0) ? scheduleAEnabled : scheduleBEnabled;
 
-  tft.fillScreen(COL_BG);
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(COL_ACCENT, COL_BG);
+  scrnSprite.fillSprite(COL_BG);
+  scrnSprite.setTextDatum(TL_DATUM);
+  scrnSprite.setTextColor(COL_ACCENT, COL_BG);
   char title[24];
   snprintf(title, sizeof(title), "Schedule %s", activeSchedule == 0 ? "A" : "B");
-  tft.drawString(title, 10, 6, 4);
-  drawButton(btnToggleEn, enabled ? "ON (tap)" : "OFF (tap)", enabled ? COL_BTN_ON : COL_BTN_OFF);
+  scrnSprite.drawString(title, 10, 6, 4);
+  drawButton(btnToggleEn, enabled ? "ON (tap)" : "OFF (tap)", enabled ? COL_BTN_ON : COL_BTN_OFF, enabled ? TFT_BLACK : TFT_WHITE);
 
   int totalPages = max(1, (count + ROWS_PER_PAGE - 1) / ROWS_PER_PAGE);
   if (listPage >= totalPages) listPage = totalPages - 1;
@@ -907,7 +1036,7 @@ void drawList() {
                arr[idx].enabled ? "" : "(disabled)");
       drawButton(rowBtns[r], row, arr[idx].enabled ? COL_BTN : COL_BTN_OFF);
     } else {
-      tft.fillRoundRect(rowBtns[r].x, rowBtns[r].y, rowBtns[r].w, rowBtns[r].h, 6, COL_BG);
+      scrnSprite.fillRoundRect(rowBtns[r].x, rowBtns[r].y, rowBtns[r].w, rowBtns[r].h, 6, COL_BG);
     }
     y += 32;
   }
@@ -926,10 +1055,10 @@ Btn btnEnToggle = {10, 160, 300, 30};
 Btn btnSave = {10, 200, 90, 32}, btnDelete = {110, 200, 90, 32}, btnCancel = {220, 200, 90, 32};
 
 void drawEdit() {
-  tft.fillScreen(COL_BG);
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(COL_ACCENT, COL_BG);
-  tft.drawString(editIndex == -1 ? "New Timer" : "Edit Timer", SCREEN_W / 2, 2, 2);
+  scrnSprite.fillSprite(COL_BG);
+  scrnSprite.setTextDatum(TC_DATUM);
+  scrnSprite.setTextColor(COL_ACCENT, COL_BG);
+  scrnSprite.drawString(editIndex == -1 ? "New Timer" : "Edit Timer", SCREEN_W / 2, 2, 2);
 
   // compact single-row time adjuster: [-] HH [+]   [-] MM [+]
   drawButton(btnHourUp, "+");
@@ -939,25 +1068,25 @@ void drawEdit() {
 
   char hm[8];
   snprintf(hm, sizeof(hm), "%02d:%02d", editBuffer.hour, editBuffer.minute);
-  tft.fillRect(0, 34, SCREEN_W, 30, COL_BG);
+  scrnSprite.fillRect(0, 34, SCREEN_W, 30, COL_BG);
   drawButton(btnHourDn, "-"); drawButton(btnHourUp, "+");
   drawButton(btnMinDn, "-"); drawButton(btnMinUp, "+");
-  tft.setTextColor(COL_TEXT, COL_BG);
-  tft.setTextDatum(MC_DATUM);
-  tft.drawString(hm, SCREEN_W / 2, 49, 4);
+  scrnSprite.setTextColor(COL_TEXT, COL_BG);
+  scrnSprite.setTextDatum(MC_DATUM);
+  scrnSprite.drawString(hm, SCREEN_W / 2, 49, 4);
 
   // weekday toggle row
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(COL_TEXT, COL_BG);
-  tft.drawString("Rings on:", 10, 70, 2);
+  scrnSprite.setTextDatum(TL_DATUM);
+  scrnSprite.setTextColor(COL_TEXT, COL_BG);
+  scrnSprite.drawString("Rings on:", 10, 70, 2);
   for (int i = 0; i < 5; i++) {
     dayBtns[i] = { (int16_t)(10 + i * 62), 90, 56, 30 };
     bool on = editBuffer.days & DAY_BITS[i];
-    drawButton(dayBtns[i], DAY_LABELS[i], on ? COL_BTN_ON : COL_BTN_OFF);
+    drawButton(dayBtns[i], DAY_LABELS[i], on ? COL_BTN_ON : COL_BTN_OFF, on ? TFT_BLACK : TFT_WHITE);
   }
 
   drawButton(btnEnToggle, editBuffer.enabled ? "Enabled: ON" : "Enabled: OFF",
-             editBuffer.enabled ? COL_BTN_ON : COL_BTN_OFF);
+             editBuffer.enabled ? COL_BTN_ON : COL_BTN_OFF, editBuffer.enabled ? TFT_BLACK : TFT_WHITE);
 
   drawButton(btnSave, "Save");
   if (editIndex != -1) drawButton(btnDelete, "Delete", COL_BTN_OFF);
@@ -967,7 +1096,7 @@ void drawEdit() {
 
 Btn btnWifiSetup = {10, 32, 300, 30};
 Btn btnCalibrate = {10, 66, 300, 30};
-Btn btnScreensaver = {10, 106, 300, 20};
+Btn btnScreensaver = {10, 100, 300, 30};
 Btn btnHrUp2 = {235, 116, 40, 30}, btnHrDn2 = {195, 116, 40, 30};
 Btn btnMinUp2 = {150, 116, 40, 30}, btnMinDn2 = {110, 116, 40, 30};
 Btn btnApplyTime = {10, 150, 140, 28};
@@ -978,10 +1107,10 @@ Btn btnOpenB   = {170, 200, 145, 30};
 struct tm manualTime;
 
 void drawSettings() {
-  tft.fillScreen(COL_BG);
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(COL_ACCENT, COL_BG);
-  tft.drawString("Settings", SCREEN_W / 2, 2, 2);
+  scrnSprite.fillSprite(COL_BG);
+  scrnSprite.setTextDatum(TC_DATUM);
+  scrnSprite.setTextColor(COL_ACCENT, COL_BG);
+  scrnSprite.drawString("Settings", SCREEN_W / 2, 2, 2);
 
   drawButton(btnWifiSetup, WiFi.status() == WL_CONNECTED ?
              "WiFi Connected - Reconfigure" : "Set Up WiFi");
@@ -989,7 +1118,7 @@ void drawSettings() {
   drawButton(btnCalibrate, "Calibrate Touch");
   drawButton(btnScreensaver, "Screensaver");
 
-  if (!getNow(manualTime)) {
+ /* if (!getNow(manualTime)) {
     manualTime = { 0 };
     manualTime.tm_hour = 8; manualTime.tm_min = 0; manualTime.tm_year = 125; manualTime.tm_mon = 0; manualTime.tm_mday = 1;
   }
@@ -1005,6 +1134,8 @@ void drawSettings() {
   drawButton(btnMinUp2, "+"); drawButton(btnMinDn2, "-");
   drawButton(btnApplyTime, "Apply Time");
   //drawButton(btnSettingsBack, "Back");
+*/
+
   drawIconButton(btnSettingsBack, ICON_BACK);
 
   drawButton(btnOpenA, "Edit A");
@@ -1101,36 +1232,50 @@ const int16_t CAL_BR_X = SCREEN_W - 24, CAL_BR_Y = SCREEN_H - 24;
 // ---------------------------------------------------------------------------
 // Screen: SCREENSAVER SETTINGS
 // ---------------------------------------------------------------------------
-Btn btnSsEnable = {10, 30, 300, 28};
-Btn btnSsMinusMin = {80, 84, 50, 28}, btnSsPlusMin = {230, 84, 50, 28};
+Btn btnSsEnable = {10, 24, 300, 24};
+Btn btnSsMinusMin = {90, 66, 50, 24}, btnSsPlusMin = {240, 66, 50, 24};
+Btn btnDimEnable = {10, 96, 300, 24};
+Btn btnDimMinus = {90, 138, 50, 24}, btnDimPlus = {240, 138, 50, 24};
 Btn btnSsBack = {10, 200, 90, 32};
 
 void drawScreensaverSettings() {
-  tft.fillScreen(COL_BG);
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(COL_ACCENT, COL_BG);
-  tft.drawString("Screensaver", SCREEN_W / 2, 2, 2);
+  scrnSprite.fillSprite(COL_BG);
+  scrnSprite.setTextDatum(TC_DATUM);
+  scrnSprite.setTextColor(COL_ACCENT, COL_BG);
+  scrnSprite.drawString("Screensaver", SCREEN_W / 2, 2, 2);
 
   drawButton(btnSsEnable, screensaverEnabled ? "Screensaver: ON" : "Screensaver: OFF",
-             screensaverEnabled ? COL_BTN_ON : COL_BTN_OFF);
+             screensaverEnabled ? COL_BTN_ON : COL_BTN_OFF, screensaverEnabled ? TFT_BLACK : TFT_WHITE);
 
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(COL_TEXT, COL_BG);
-  tft.drawString("Idle timeout:", 10, 70, 2);
+  scrnSprite.setTextDatum(TL_DATUM);
+  scrnSprite.setTextColor(COL_TEXT, COL_BG);
+  scrnSprite.drawString("Idle timeout:", 10, 54, 2);
   drawButton(btnSsMinusMin, "-");
   drawButton(btnSsPlusMin, "+");
   char mins[16];
   snprintf(mins, sizeof(mins), "%d min", screensaverIdleMinutes);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(COL_TEXT, COL_BG);
-  tft.drawString(mins, 165, 98, 4);
+  scrnSprite.setTextDatum(MC_DATUM);
+  scrnSprite.setTextColor(COL_TEXT, COL_BG);
+  scrnSprite.drawString(mins, 185, 78, 4);
 
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(COL_TEXT, COL_BG);
-  tft.drawString("Only kicks in from the Home screen. Wakes on any", 10, 140, 1);
-  char note2[64];
-  snprintf(note2, sizeof(note2), "touch, or automatically %d min before a due bell.", SCREENSAVER_WAKE_LEAD_MIN);
-  tft.drawString(note2, 10, 152, 1);
+  drawButton(btnDimEnable, dimEnabled ? "Dim Backlight: ON" : "Dim Backlight: OFF",
+             dimEnabled ? COL_BTN_ON : COL_BTN_OFF, screensaverEnabled ? TFT_BLACK : TFT_WHITE);
+  scrnSprite.setTextDatum(TL_DATUM);
+  scrnSprite.setTextColor(COL_TEXT, COL_BG);
+  scrnSprite.drawString("Dim level:", 10, 126, 2);
+  drawButton(btnDimMinus, "-");
+  drawButton(btnDimPlus, "+");
+  char pct[16];
+  snprintf(pct, sizeof(pct), "%d%%", dimLevelPercent);
+  scrnSprite.setTextDatum(MC_DATUM);
+  scrnSprite.setTextColor(COL_TEXT, COL_BG);
+  scrnSprite.drawString(pct, 185, 150, 4);
+
+  scrnSprite.setTextDatum(TL_DATUM);
+  scrnSprite.setTextColor(COL_TEXT, COL_BG);
+  char note[70];
+  snprintf(note, sizeof(note), "Both share the idle timeout above; wake on touch or %d min before a bell.", SCREENSAVER_WAKE_LEAD_MIN);
+  scrnSprite.drawString(note, 10, 172, 1);
 
   //drawButton(btnSsBack, "Back");
   drawIconButton(btnSsBack,ICON_BACK);
@@ -1146,6 +1291,18 @@ void handleScreensaverSettingsTouch(int16_t x, int16_t y) {
     if (screensaverIdleMinutes < 30) screensaverIdleMinutes++;
     saveSchedules(); drawScreensaverSettings(); return;
   }
+    if (hit(btnDimEnable, x, y)) {
+    dimEnabled = !dimEnabled;
+    saveSchedules(); drawScreensaverSettings(); return;
+  }
+  if (hit(btnDimMinus, x, y)) {
+    if (dimLevelPercent > 5) dimLevelPercent -= 5;
+    saveSchedules(); drawScreensaverSettings(); return;
+  }
+  if (hit(btnDimPlus, x, y)) {
+    if (dimLevelPercent < 100) dimLevelPercent += 5;
+    saveSchedules(); drawScreensaverSettings(); return;
+  }
   if (hit(btnSsBack, x, y)) { currentScreen = SCR_SETTINGS; drawSettings(); return; }
 }
 
@@ -1156,27 +1313,27 @@ void handleScreensaverSettingsTouch(int16_t x, int16_t y) {
 // ---------------------------------------------------------------------------
 
 void drawCrosshair(int16_t cx, int16_t cy) {
-  tft.drawLine(cx - 10, cy, cx + 10, cy, COL_ACCENT);
-  tft.drawLine(cx, cy - 10, cx, cy + 10, COL_ACCENT);
-  tft.drawCircle(cx, cy, 6, COL_ACCENT);
+  scrnSprite.drawLine(cx - 10, cy, cx + 10, cy, COL_ACCENT);
+  scrnSprite.drawLine(cx, cy - 10, cx, cy + 10, COL_ACCENT);
+  scrnSprite.drawCircle(cx, cy, 6, COL_ACCENT);
 }
 
 void drawCalib() {
-  tft.fillScreen(COL_BG);
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(COL_ACCENT, COL_BG);
-  tft.drawString("Touch Calibration", SCREEN_W / 2, 10, 2);
-  tft.setTextColor(COL_TEXT, COL_BG);
+  scrnSprite.fillSprite(COL_BG);
+  scrnSprite.setTextDatum(TC_DATUM);
+  scrnSprite.setTextColor(COL_ACCENT, COL_BG);
+  scrnSprite.drawString("Touch Calibration", SCREEN_W / 2, 10, 2);
+  scrnSprite.setTextColor(COL_TEXT, COL_BG);
 
   if (calibStep == CAL_TL) {
-    tft.drawString("Tap the crosshair, top-left", SCREEN_W / 2, 40, 2);
+    scrnSprite.drawString("Tap the crosshair, top-left", SCREEN_W / 2, 40, 2);
     drawCrosshair(CAL_TL_X, CAL_TL_Y);
   } else if (calibStep == CAL_BR) {
-    tft.drawString("Tap the crosshair, bottom-right", SCREEN_W / 2, 40, 2);
+    scrnSprite.drawString("Tap the crosshair, bottom-right", SCREEN_W / 2, 40, 2);
     drawCrosshair(CAL_BR_X, CAL_BR_Y);
   } else {
-    tft.drawString("Calibration saved!", SCREEN_W / 2, 110, 4);
-    tft.drawString("Returning to Settings...", SCREEN_W / 2, 140, 2);
+    scrnSprite.drawString("Calibration saved!", SCREEN_W / 2, 110, 4);
+    scrnSprite.drawString("Returning to Settings...", SCREEN_W / 2, 140, 2);
   }
 }
 
@@ -1211,14 +1368,16 @@ void handleCalibTouch() {
 
 void handleSettingsTouch(int16_t x, int16_t y) {
   if (hit(btnWifiSetup, x, y)) {
-    tft.fillScreen(COL_BG);
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(COL_TEXT, COL_BG);
-    tft.drawString("Join 'BellScheduler-Setup' WiFi", SCREEN_W / 2, 100, 2);
-    tft.drawString("to configure, then wait...", SCREEN_W / 2, 130, 2);
+    scrnSprite.fillSprite(COL_BG);
+    scrnSprite.setTextDatum(MC_DATUM);
+    scrnSprite.setTextColor(COL_TEXT, COL_BG);
+    scrnSprite.drawString("Join 'BellScheduler-Setup' WiFi", SCREEN_W / 2, 100, 2);
+    scrnSprite.drawString("to configure, then wait...", SCREEN_W / 2, 130, 2);
     WiFiManager wm;
     wm.setConfigPortalTimeout(180);
+    esp_task_wdt_delete(NULL);
     wm.startConfigPortal("BellScheduler-Setup");
+    esp_task_wdt_add(NULL);
     if (WiFi.status() == WL_CONNECTED) {
       configTzTime(timezone,ntpServer);
     }
@@ -1239,6 +1398,7 @@ void handleSettingsTouch(int16_t x, int16_t y) {
     return;
   }
 
+  /*
   if (hit(btnHrUp2, x, y)) { manualTime.tm_hour = (manualTime.tm_hour + 1) % 24; drawSettings(); return; }
   if (hit(btnHrDn2, x, y)) { manualTime.tm_hour = (manualTime.tm_hour + 23) % 24; drawSettings(); return; }
   if (hit(btnMinUp2, x, y)) { manualTime.tm_min = (manualTime.tm_min + 1) % 60; drawSettings(); return; }
@@ -1257,6 +1417,8 @@ void handleSettingsTouch(int16_t x, int16_t y) {
     drawSettings();
     return;
   }
+    */
+
   if (hit(btnSettingsBack, x, y)) { currentScreen = SCR_HOME; drawHome(); return; }
   if (hit(btnOpenA, x, y)) { activeSchedule = 0; listPage = 0; currentScreen = SCR_LIST; drawList(); return; }
   if (hit(btnOpenB, x, y)) { activeSchedule = 1; listPage = 0; currentScreen = SCR_LIST; drawList(); return; }
@@ -1282,51 +1444,51 @@ unsigned long resetArmedAt = 0;
 #define RESET_ARM_WINDOW_MS 4000
 
 void drawServiceInfo() {
-  tft.fillRect(0, 30, SCREEN_W, 82, COL_BG); // ends exactly where the button row begins (y=112)
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(COL_TEXT, COL_BG);
+  scrnSprite.fillRect(0, 30, SCREEN_W, 82, COL_BG); // ends exactly where the button row begins (y=112)
+  scrnSprite.setTextDatum(TL_DATUM);
+  scrnSprite.setTextColor(COL_TEXT, COL_BG);
   char line[64];
   int y = 32;
 
 
   snprintf(line, sizeof(line), "Firmware version: %s", AUTO_VERSION);
-  tft.drawString(line,10,y,1); y+= 13;
+  scrnSprite.drawString(line,10,y,1); y+= 13;
 
   snprintf(line, sizeof(line), "Firmware built: %s %s", __DATE__, __TIME__);
-  tft.drawString(line, 10, y, 1); y += 13;
+  scrnSprite.drawString(line, 10, y, 1); y += 13;
   
   unsigned long upSec = millis() / 1000;
   snprintf(line, sizeof(line), "Uptime: %luh %02lum %02lus", upSec / 3600, (upSec / 60) % 60, upSec % 60);
-  tft.drawString(line, 10, y, 1); y += 13;
+  scrnSprite.drawString(line, 10, y, 1); y += 13;
 
   snprintf(line, sizeof(line), "Free heap: %lu bytes", (unsigned long)ESP.getFreeHeap());
-  tft.drawString(line, 10, y, 1); y += 13;
+  scrnSprite.drawString(line, 10, y, 1); y += 13;
  if (WiFi.status() == WL_CONNECTED) {
     snprintf(line, sizeof(line), "WiFi: %s  IP: %s  RSSI: %d dBm",
              WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
   } else {
     snprintf(line, sizeof(line), "WiFi: not connected");
   }
-  tft.drawString(line, 10, y, 1); y += 13;
+  scrnSprite.drawString(line, 10, y, 1); y += 13;
 
   snprintf(line, sizeof(line), "Touch cal: X[%d,%d] Y[%d,%d]", tsMinX, tsMaxX, tsMinY, tsMaxY);
-  tft.drawString(line, 10, y, 1); y += 13;
+  scrnSprite.drawString(line, 10, y, 1); y += 13;
 
-  tft.fillRect(0, y, SCREEN_W, 13, COL_BG);
+  scrnSprite.fillRect(0, y, SCREEN_W, 13, COL_BG);
   if (ts.touched()) {
     TS_Point p = ts.getPoint();
     snprintf(line, sizeof(line), "Raw touch: X=%d Y=%d (touch anywhere to test)", p.x, p.y);
   } else {
     snprintf(line, sizeof(line), "Raw touch: -- (touch anywhere to test)");
   }
-  tft.drawString(line, 10, y, 1);
+  scrnSprite.drawString(line, 10, y, 1);
 }
 
 void drawService() {
-  tft.fillScreen(COL_BG);
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(COL_ACCENT, COL_BG);
-  tft.drawString("Service Menu", SCREEN_W / 2, 4, 2);
+  scrnSprite.fillSprite(COL_BG);
+  scrnSprite.setTextDatum(TC_DATUM);
+  scrnSprite.setTextColor(COL_ACCENT, COL_BG);
+  scrnSprite.drawString("Service Menu", SCREEN_W / 2, 4, 2);
   resetArmed = false;
   drawServiceInfo();
 
@@ -1402,7 +1564,7 @@ void serviceMenuTick() {
 // exits back to Home - on any touch (see handleTouch() above) or
 // automatically once a bell is due soon (see screensaverTick() below).
 const int16_t SS_BOX_W = 140, SS_BOX_H = 50;
-const int16_t SS_TOP_MARGIN = 20; // keep clear of nothing in particular - just looks better
+const int16_t SS_TOP_MARGIN = 0;
 float ssX = 60, ssY = 60, ssVX = 1.6, ssVY = 1.3;
 uint16_t ssColor = TFT_CYAN;
 unsigned long lastSsFrame = 0;
@@ -1410,6 +1572,61 @@ unsigned long lastSsFrame = 0;
 uint16_t randomBounceColor() {
   uint16_t palette[] = { TFT_CYAN, TFT_YELLOW, TFT_MAGENTA, TFT_GREEN, TFT_ORANGE, COL_ACCENT };
   return palette[random(0, 6)];
+}
+
+// Backlight control - shares the idle timer above but is switched
+// independently of the bouncing-clock visual. Fades smoothly over
+// BACKLIGHT_FADE_MS rather than snapping instantly, using a time-based
+// interpolation (not a fixed step count) so a small change and a large one
+// both take the same duration rather than the large one taking longer.
+// Non-blocking throughout - serviceBacklightFade() is called once per
+// loop() iteration and only ever does simple arithmetic plus one ledcWrite.
+#define BACKLIGHT_FADE_MS 300
+uint8_t backlightDuty = 255;          // last value actually written to the PWM channel
+uint8_t backlightFadeFrom = 255;
+uint8_t backlightFadeTo = 255;
+unsigned long backlightFadeStartMillis = 0;
+bool backlightFading = false;
+
+void applyBacklight(uint8_t duty) {
+  backlightDuty = duty;
+  ledcWrite(BACKLIGHT_PWM_CHANNEL, duty);
+}
+
+void fadeBacklightTo(uint8_t target) {
+  if (!backlightFading && target == backlightDuty) return; // already there, nothing to do
+  // Starting from backlightDuty (not backlightFadeFrom) means a fade that
+  // gets reversed partway through - e.g. a touch arriving while the screen
+  // is mid-fade-to-dim - continues smoothly from wherever it currently is,
+  // rather than jumping back to where the previous fade started.
+  backlightFadeFrom = backlightDuty;
+  backlightFadeTo = target;
+  backlightFadeStartMillis = millis();
+  backlightFading = true;
+}
+
+void serviceBacklightFade() {
+  if (!backlightFading) return;
+  unsigned long elapsed = millis() - backlightFadeStartMillis;
+  if (elapsed >= BACKLIGHT_FADE_MS) {
+    applyBacklight(backlightFadeTo);
+    backlightFading = false;
+    return;
+  }
+  int delta = (int)backlightFadeTo - (int)backlightFadeFrom;
+  applyBacklight((uint8_t)(backlightFadeFrom + (delta * (long)elapsed) / BACKLIGHT_FADE_MS));
+}
+
+void dimBacklight() {
+  if (isDimmed) return;
+  fadeBacklightTo((uint8_t)map(dimLevelPercent, 0, 100, 0, 255));
+  isDimmed = true;
+}
+
+void undimBacklight() {
+  if (!isDimmed) return;
+  fadeBacklightTo(255);
+  isDimmed = false;
 }
 
 void enterScreensaver() {
@@ -1424,6 +1641,7 @@ void enterScreensaver() {
 }
 
 void exitScreensaver() {
+  undimBacklight();
   currentScreen = SCR_HOME;
   drawHome();
 }
@@ -1460,7 +1678,7 @@ void screensaverTick() {
   scrnSprite.setTextColor(TFT_BLACK, ssColor);
   scrnSprite.drawString(hm, (int)ssX + SS_BOX_W / 2, (int)ssY + SS_BOX_H / 2, 4);
 
-  scrnSprite.pushSprite(0,0);
+  //scrnSprite.pushSprite(0,0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1471,6 +1689,7 @@ void handleTouch() {
   bool down = getTouchPoint(x, y);
   if (down && !touchWasDown) {
     lastActivityMillis = millis(); // any tap counts as activity, on any screen
+    undimBacklight();
     switch (currentScreen) {
       case SCR_HOME:     handleHomeTouch(x, y); break;
       case SCR_LIST:     handleListTouch(x, y); break;
@@ -1509,17 +1728,30 @@ void setup() {
 
   tft.init();
 
+  // Take over the backlight pin with PWM (must happen after tft.init(),
+  // which otherwise leaves it as a plain digitalWrite HIGH via
+  // TFT_BACKLIGHT_ON in User_Setup.h) so it can be dimmed rather than only
+  // switched fully on/off. COMPATIBILITY NOTE: this uses the ledcSetup +
+  // ledcAttachPin form standard on arduino-esp32 core 2.x. Core 3.x
+  // simplified this to a single ledcAttach(pin, freq, resolution) call and
+  // writes duty via ledcWrite(pin, ...) directly instead of by channel - if
+  // this fails to compile on core 3.x, swap to that form (same idea as the
+  // watchdog note above).
+  ledcSetup(BACKLIGHT_PWM_CHANNEL, BACKLIGHT_PWM_FREQ_HZ, BACKLIGHT_PWM_RES_BITS);
+  ledcAttachPin(TFT_BL_PIN, BACKLIGHT_PWM_CHANNEL);
+  applyBacklight(255); // full brightness at boot - no fade needed, nothing to fade from yet
+
 #if ESP_IDF_VERSION_MAJOR == 5
   ledcAttach(LCD_BACK_LIGHT_PIN,LEDC_BASE_FREQ,LEDC_TIMER_12_BIT);
 #else
-  ledcSetup(LEDC_CHANNEL_0, LEDC_BASE_FREQ, LEDC_TIMER_12_BIT);
-  ledcAttachPin(LCD_BACK_LIGHT_PIN,LEDC_CHANNEL_0);
+//  ledcSetup(LEDC_CHANNEL_0, LEDC_BASE_FREQ, LEDC_TIMER_12_BIT);
+//  ledcAttachPin(LCD_BACK_LIGHT_PIN,LEDC_CHANNEL_0);
 #endif
 
   tft.setRotation(1); // landscape, 320x240
   tft.fillScreen(COL_BG);
 
-  ledcAnalogWrite(LEDC_CHANNEL_0, 128);
+  //ledcAnalogWrite(LEDC_CHANNEL_0, 128);
 
 
   touchSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
@@ -1556,6 +1788,8 @@ void setup() {
     timeSynced = getLocalTime(&t, 8000);
   }
 
+  startWatchdog();
+
   polycomSetup();
 
   initWebServer();
@@ -1575,11 +1809,15 @@ void setup() {
   currentScreen = SCR_HOME;
   drawHome();
   lastActivityMillis = millis(); // start the idle clock from here, not from cold boot
+
+  
 }
 
 void loop() {
 
   struct tm timeinfo;
+
+  esp_task_wdt_reset();
 
   // Hourly sync with NTP server
   if (getLocalTime(&timeinfo)) {    
@@ -1597,15 +1835,28 @@ void loop() {
   serviceMenuTick();
   adminServer.handleClient();
   screensaverTick();
+  serviceBacklightFade();
+  scrnSprite.pushSprite(0,0);
+
 
   if (currentScreen == SCR_HOME) {
     static unsigned long lastClock = 0;
     if (millis() - lastClock > 500) { updateHomeClock(false); lastClock = millis(); }
-    
-    if (screensaverEnabled && !bellImminent() &&
-        millis() - lastActivityMillis > (unsigned long)screensaverIdleMinutes * 60000UL) {
-      enterScreensaver();
+
+    bool idleNow = millis() - lastActivityMillis > (unsigned long)screensaverIdleMinutes * 60000UL;
+    bool imminent = bellImminent();
+
+    if (idleNow && !imminent) {
+      if (dimEnabled) dimBacklight();
+      if (screensaverEnabled) enterScreensaver();
+    } else if (imminent && isDimmed) {
+      undimBacklight();
     }
+    
+    //if (screensaverEnabled && !bellImminent() &&
+    //    millis() - lastActivityMillis > (unsigned long)screensaverIdleMinutes * 60000UL) {
+    //  enterScreensaver();
+    //}
   }
 
   ElegantOTA.loop();
