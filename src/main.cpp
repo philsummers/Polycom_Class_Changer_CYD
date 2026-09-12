@@ -83,6 +83,9 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
 #include <WiFiManager.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -177,6 +180,9 @@ int16_t tsMinX = 200, tsMaxX = 3800, tsMinY = 200, tsMaxY = 3800;
 
 
 TFT_eSprite scrnSprite = TFT_eSprite(&tft);
+
+bool audioBroadcastABusy = false;
+bool audioBroadcastBBusy = false;
 
 
 // ---------------------------------------------------------------------------
@@ -621,8 +627,55 @@ bool bellImminent() {
 bool bellAActive = false; unsigned long bellAOffAt = 0;
 bool bellBActive = false; unsigned long bellBOffAt = 0;
 
-void triggerBellA() { digitalWrite(BELL_A_PIN, HIGH); bellAActive = true; bellAOffAt = millis() + BELL_PULSE_MS; broadcastAudio(channel1);}
-void triggerBellB() { digitalWrite(BELL_B_PIN, HIGH); bellBActive = true; bellBOffAt = millis() + BELL_PULSE_MS; broadcastAudio(channel2);}
+void audioBroadcastTaskA(void *param) {
+  broadcastAudio(channel1);
+  audioBroadcastABusy = false;
+  vTaskDelete(NULL);
+}
+
+void audioBroadcastTaskB(void *param) {
+  broadcastAudio(channel2);
+  audioBroadcastBBusy = false;
+  vTaskDelete(NULL);
+}
+
+void startAudioBroadcastA() {
+  if (audioBroadcastABusy) {
+    Serial.println("Audio broadcast A already running - skipping this trigger");
+    return;
+  }
+  audioBroadcastABusy = true;
+  xTaskCreatePinnedToCore(
+    audioBroadcastTaskA,
+    "AudioBroadcastA",
+    8192,
+    NULL,
+    1,
+    NULL,
+    0
+  );
+}
+
+void startAudioBroadcastB() {
+  if (audioBroadcastBBusy) {
+    Serial.println("Audio broadcast B already running - skipping this trigger");
+    return;
+  }
+  audioBroadcastBBusy = true;
+  xTaskCreatePinnedToCore(
+    audioBroadcastTaskB,
+    "AudioBroadcastB",
+    8192,
+    NULL,
+    1,
+    NULL,
+    0
+  );
+}
+
+
+void triggerBellA() { digitalWrite(BELL_A_PIN, HIGH); bellAActive = true; bellAOffAt = millis() + BELL_PULSE_MS; startAudioBroadcastA();}
+void triggerBellB() { digitalWrite(BELL_B_PIN, HIGH); bellBActive = true; bellBOffAt = millis() + BELL_PULSE_MS; startAudioBroadcastB();}
 
 void serviceBells() {
   if (bellAActive && millis() >= bellAOffAt) { digitalWrite(BELL_A_PIN, LOW); bellAActive = false; }
